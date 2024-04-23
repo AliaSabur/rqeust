@@ -1,5 +1,5 @@
 use std::{
-    pin::Pin, task::{
+    borrow::Cow, pin::Pin, task::{
         Context,
         Poll,
     }
@@ -11,7 +11,8 @@ use futures_util::{
     Stream,
     StreamExt,
 };
-use http::{header, StatusCode};
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use http::{header, HeaderValue, StatusCode};
 use tungstenite::protocol::WebSocketConfig;
 use crate::{error::Kind, RequestBuilder};
 pub use tungstenite::Message;
@@ -23,7 +24,7 @@ use crate::Error;
 pub struct UpgradedRequestBuilder {
     inner: RequestBuilder,
     nonce: String,
-    protocols: Vec<String>,
+    protocol: Option<HeaderValue>,
     config: WebSocketConfig,
 }
 
@@ -43,14 +44,38 @@ impl UpgradedRequestBuilder {
         Self {
             inner,
             nonce,
-            protocols: vec![],
+            protocol: None,
             config: WebSocketConfig::default(),
         }
     }
 
     /// Sets the websocket subprotocols to request.
-    pub fn protocols(mut self, protocols: Vec<String>) -> Self {
-        self.protocols.extend(protocols);
+    pub fn protocols<I>(mut self, protocols: I) -> Self 
+    where
+        I: IntoIterator,
+        I::Item: Into<Cow<'static, str>>,
+    {
+        if let Some(req_protocols) = self
+            .protocol
+            .as_ref()
+            .and_then(|p| p.to_str().ok())
+        {
+            self.protocol = protocols
+                .into_iter()
+                // FIXME: This will often allocate a new `String` and so is less efficient than it
+                // could be. But that can't be fixed without breaking changes to the public API.
+                .map(Into::into)
+                .find(|protocol| {
+                    req_protocols
+                        .split(',')
+                        .any(|req_protocol| req_protocol.trim() == protocol)
+                })
+                .map(|protocol| match protocol {
+                    Cow::Owned(s) => HeaderValue::from_str(&s).unwrap(),
+                    Cow::Borrowed(s) => HeaderValue::from_static(s),
+                });
+        }
+
         self
     }
 
@@ -92,16 +117,8 @@ impl UpgradedRequestBuilder {
             let mut request = request_result?;
 
             // sets subprotocols
-            if !self.protocols.is_empty() {
-                let subprotocols = self.protocols
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<&str>>()
-                    .join(", ");
-
-                request.headers_mut()
-                    .insert(header::SEC_WEBSOCKET_PROTOCOL, subprotocols.parse().map_err(|_| 
-                        Error::new(Kind::Builder, Some("invalid subprotocol")))?);
+            if let Some(protocol) = self.protocol.as_ref() {
+                request.headers_mut().insert(header::SEC_WEBSOCKET_PROTOCOL, protocol.clone());
             }
 
             // change the scheme from wss? to https?
@@ -126,7 +143,7 @@ impl UpgradedRequestBuilder {
         Ok(UpgradeResponse {
             inner,
             nonce: self.nonce,
-            protocols: self.protocols,
+            protocol: self.protocol,
             config: self.config,
         })
     }
@@ -140,7 +157,7 @@ impl UpgradedRequestBuilder {
 pub struct UpgradeResponse {
     inner: crate::Response,
     nonce: String,
-    protocols: Vec<String>,
+    protocol: Option<HeaderValue>,
     config: WebSocketConfig,
 }
 
@@ -192,11 +209,9 @@ impl UpgradeResponse {
             }
 
             let protocol = headers
-                .get(header::SEC_WEBSOCKET_PROTOCOL)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_owned());
+                .get(header::SEC_WEBSOCKET_PROTOCOL);
 
-            match (self.protocols.is_empty(), &protocol) {
+            match (self.protocol.is_none(), &protocol) {
                 (true, None) => {
                     // we didn't request any protocols, so we don't expect one
                     // in return
@@ -206,9 +221,12 @@ impl UpgradeResponse {
                     return Err(Error::new(Kind::Status(self.res.status()), Some("missing protocol")));
                 }
                 (false, Some(protocol)) => {
-                    if !self.protocols.contains(protocol) {
-                        // the responded protocol is none which we requested
-                        return Err(Error::new(Kind::Status(self.res.status()), Some("invalid protocol")));
+                    if let Some(self_protocols) = self.protocol.as_ref() {
+                        if !self_protocols.eq(protocol) {
+                            // the responded protocol is none which we requested
+                            return Err(Error::new(Kind::Status(self.res.status()), Some("invalid protocol")));
+                        
+                        }
                     }
                 }
                 (true, Some(_)) => {
@@ -217,7 +235,7 @@ impl UpgradeResponse {
                 }
             }
 
-            use tokio_util::compat::TokioAsyncReadCompatExt;
+            let protocol = protocol.cloned();
 
             let inner = async_tungstenite::WebSocketStream::from_raw_socket(
                 self.inner.upgrade().await?.compat(),
@@ -229,7 +247,7 @@ impl UpgradeResponse {
             (inner, protocol)
         };
 
-        Ok(WebSocket { inner, protocol })
+        Ok(WebSocket { inner, protocol: protocol.clone() })
     }
 }
 
@@ -237,13 +255,13 @@ impl UpgradeResponse {
 #[derive(Debug)]
 pub struct WebSocket {
     inner: async_tungstenite::WebSocketStream<tokio_util::compat::Compat<crate::Upgraded>>,
-    protocol: Option<String>,
+    protocol: Option<HeaderValue>,
 }
 
 impl WebSocket {
     /// Returns the subprotocol that the server has accepted.
-    pub fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+    pub fn protocol(&self) -> Option<&HeaderValue> {
+        self.protocol.as_ref()
     }
 }
 

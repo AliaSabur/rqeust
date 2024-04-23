@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()?
         .get("wss://echo.websocket.org")
         .upgrade()
+        .protocols(["chat", "superchat"])
         .send()
         .await?
         .into_websocket()
