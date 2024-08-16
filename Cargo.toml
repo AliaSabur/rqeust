@@ -1,6 +1,6 @@
 [package]
 name = "rquest"
-version = "0.20.35"
+version = "0.20.50"
 description = "An fast asynchronous Rust Http/WebSocket Client with TLS/JA3/JA4/HTTP2 fingerprint impersonate"
 keywords = ["http", "client", "websocket", "ja3", "ja4"]
 categories = ["web-programming::http-client"]
@@ -208,6 +208,10 @@ path = "examples/simple.rs"
 [[example]]
 name = "impersonate"
 path = "examples/impersonate.rs"
+
+[[example]]
+name = "impersonate_with_headers"
+path = "examples/impersonate_with_headers.rs"
 
 [[example]]
 name = "psk_impersonate"

@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-Preconfigured `TLS`/`HTTP2`
+Preconfigured `TLS`/`HTTP2`/`Headers`
 
 ```toml
 [dependencies]
@@ -111,7 +111,7 @@ use rquest::{
     tls::{Http2FrameSettings, TlsExtensionSettings, TlsSettings},
     HttpVersionPref,
 };
-use rquest::{PseudoOrder, SettingsOrder, StreamDependency, StreamId};
+use rquest::{PseudoOrder, SettingsOrder};
 use std::error::Error;
 
 #[tokio::main]
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .max_header_list_size(262144)
                 .header_table_size(65536)
                 .enable_push(None)
-                .headers_priority(StreamDependency::new(StreamId::zero(), 255, true))
+                .headers_priority((0, 255, true))
                 .headers_pseudo_order([
                     PseudoOrder::Method,
                     PseudoOrder::Scheme,
@@ -189,5 +189,3 @@ Your question might already be answered on the [issues](https://github.com/0x676
 Apache-2.0 [LICENSE](LICENSE)
 
 ## Accolades
-
-The project is based on a fork of [reqwest](https://github.com/seanmonstar/reqwest).
