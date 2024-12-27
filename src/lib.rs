@@ -7,11 +7,10 @@
 //!
 //! An ergonomic, all-in-one `JA3`/`JA4`/`HTTP2` fingerprint `HTTP`/`WebSocket` client.
 //!
-//! - Async Client
 //! - Plain bodies, [JSON](#json), [urlencoded](#forms), [multipart], [websocket](#websocket)
-//! - Headers Order
-//! - Customizable [redirect policy](#redirect-policies)
+//! - Header Order
 //! - Cookies Store
+//! - [Redirect policy](#redirect-policies)
 //! - Uses [BoringSSL](#tls)
 //! - HTTP [Proxies](#proxies)
 //! - [Preconfigured](#preconfigured-tls) `TLS`/`HTTP2`/`Headers` settings
@@ -28,14 +27,13 @@
 //! The `impersonate` module provides a way to simulate various browser fingerprints.
 //!
 //! ```rust,no_run
-//! use std::error::Error;
 //! use rquest::tls::Impersonate;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
-//!     // Build a client to mimic Chrome129
+//! async fn main() -> Result<(), rquest::Error> {
+//!     // Build a client to mimic Chrome131
 //!     let client = rquest::Client::builder()
-//!         .impersonate(Impersonate::Chrome129)
+//!         .impersonate(Impersonate::Chrome131)
 //!         .build()?;
 //!
 //!     // Use the API you're already familiar with
@@ -53,16 +51,14 @@
 //! ```rust,no_run
 //! use futures_util::{SinkExt, StreamExt, TryStreamExt};
 //! use rquest::{tls::Impersonate, Client, Message};
-//! use std::error::Error;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
+//! async fn main() -> Result<(), rquest::Error> {
+//!     // Build a client to mimic Chrome131
 //!     let websocket = Client::builder()
-//!         .impersonate(Impersonate::Chrome127)
-//!         .http1_only()
+//!         .impersonate(Impersonate::Chrome131)
 //!         .build()?
-//!         .get("wss://echo.websocket.org")
-//!         .upgrade()
+//!         .websocket("wss://echo.websocket.org")
 //!         .send()
 //!         .await?
 //!         .into_websocket()
@@ -87,74 +83,6 @@
 //!
 //!     Ok(())
 //! }
-//! ```
-//!
-//! ## Preconfigured-TLS
-//! If you need to use a pre-configured TLS settings, you can use the [use_preconfigured_tls][preconfigured] method on the `ClientBuilder`.
-//!
-//! ```rust
-//!use boring::ssl::{SslConnector, SslMethod};
-//!use http::{header, HeaderValue};
-//!use rquest::{
-//!    tls::{Http2Settings, ImpersonateSettings, TlsExtensionSettings},
-//!    HttpVersionPref,
-//!};
-//!use rquest::{PseudoOrder::*, SettingsOrder::*};
-//!use std::error::Error;
-//!
-//!#[tokio::main]
-//!async fn main() -> Result<(), Box<dyn Error>> {
-//!    // Create a pre-configured TLS settings
-//!    let settings = ImpersonateSettings::builder()
-//!        .tls((
-//!            SslConnector::builder(SslMethod::tls_client())?,
-//!            TlsExtensionSettings::builder()
-//!                .tls_sni(true)
-//!                .http_version_pref(HttpVersionPref::All)
-//!                .application_settings(true)
-//!                .pre_shared_key(true)
-//!                .enable_ech_grease(true)
-//!                .permute_extensions(true)
-//!                .build(),
-//!        ))
-//!        .http2(
-//!            Http2Settings::builder()
-//!                .initial_stream_window_size(6291456)
-//!                .initial_connection_window_size(15728640)
-//!                .max_concurrent_streams(1000)
-//!                .max_header_list_size(262144)
-//!                .header_table_size(65536)
-//!                .enable_push(false)
-//!                .headers_priority((0, 255, true))
-//!                .headers_pseudo_order([Method, Scheme, Authority, Path])
-//!                .settings_order(vec![
-//!                    HeaderTableSize,
-//!                    EnablePush,
-//!                    MaxConcurrentStreams,
-//!                    InitialWindowSize,
-//!                    MaxFrameSize,
-//!                    MaxHeaderListSize,
-//!                    EnableConnectProtocol,
-//!                ])
-//!                .build(),
-//!        )
-//!        .headers(Box::new(|headers| {
-//!            headers.insert(header::USER_AGENT, HeaderValue::from_static("rquest"));
-//!        }))
-//!        .build();
-//!
-//!    // Build a client with pre-configured TLS settings
-//!    let client = rquest::Client::builder()
-//!        .use_preconfigured_tls(settings)
-//!        .build()?;
-//!
-//!    // Use the API you're already familiar with
-//!    let resp = client.get("https://tls.peet.ws/api/all").send().await?;
-//!    println!("{}", resp.text().await?);
-//!
-//!    Ok(())
-//!}
-//!
 //! ```
 //!
 //! ## Making a GET request
@@ -249,9 +177,8 @@
 //!
 //! ## Redirect Policies
 //!
-//! By default, a `Client` will automatically handle HTTP redirects, having a
-//! maximum redirect chain of 10 hops. To customize this behavior, a
-//! [`redirect::Policy`][redirect] can be used with a `ClientBuilder`.
+//! By default, the client does not handle HTTP redirects.
+//! To customize this behavior, you can use [`redirect::Policy`][redirect] with ClientBuilder.
 //!
 //! ## Cookies
 //!
@@ -291,8 +218,6 @@
 //! The following are a list of [Cargo features][cargo-features] that can be
 //! enabled or disabled:
 //!
-//! - **boring-tls** *(enabled by default)*: Provides TLS support to connect
-//!   over HTTPS.
 //! - **websocket**: Provides websocket support.
 //! - **cookies**: Provides cookie session support.
 //! - **gzip**: Provides response body gzip decompression.
@@ -318,24 +243,25 @@
 //! [cargo-features]: https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-features-section
 
 /// Re-export of boring to keep versions in check
-#[cfg(feature = "boring-tls")]
 pub use boring;
-#[cfg(feature = "boring-tls")]
+
 pub use boring_sys;
+#[cfg(feature = "hickory-dns")]
+pub use hickory_resolver;
 pub use http::header;
 pub use http::Method;
 pub use http::{StatusCode, Version};
+
+pub use tokio_boring;
 pub use url::Url;
 
 // universal mods
 #[macro_use]
 mod error;
 mod into_url;
-mod response;
 
 pub use self::error::{Error, Result};
 pub use self::into_url::IntoUrl;
-pub use self::response::ResponseBuilderExt;
 
 /// Shortcut method to quickly make a `GET` request.
 ///
@@ -375,10 +301,8 @@ pub async fn get<T: IntoUrl>(url: T) -> crate::Result<Response> {
 #[cfg(feature = "websocket")]
 pub async fn websocket<T: IntoUrl>(url: T) -> crate::Result<WebSocket> {
     Client::builder()
-        .http1_only()
         .build()?
-        .get(url)
-        .upgrade()
+        .websocket(url)
         .send()
         .await?
         .into_websocket()
@@ -397,10 +321,7 @@ fn _assert_impls() {
     assert_send::<Request>();
     assert_send::<RequestBuilder>();
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        assert_send::<Response>();
-    }
+    assert_send::<Response>();
 
     assert_send::<Error>();
     assert_sync::<Error>();
@@ -419,17 +340,17 @@ pub use self::client::{
     Body, Client, ClientBuilder, HttpVersionPref, Request, RequestBuilder, Response, Upgraded,
 };
 pub use self::proxy::{NoProxy, Proxy};
-
-#[cfg(feature = "boring-tls")]
-pub use hyper::{PseudoOrder, SettingsOrder};
+pub use self::util::client::Dst;
+pub use hyper2::{PseudoOrder, SettingsOrder};
 
 mod client;
 mod connect;
 #[cfg(feature = "cookies")]
 pub mod cookie;
 pub mod dns;
+mod macros;
 mod proxy;
 pub mod redirect;
-#[cfg(feature = "boring-tls")]
+
 pub mod tls;
 mod util;

@@ -1,7 +1,8 @@
+#![cfg(not(target_arch = "wasm32"))]
 mod support;
-use futures_util::stream::StreamExt;
-use hyper::Body;
-use support::*;
+use http_body_util::BodyExt;
+use rquest::Body;
+use support::server;
 
 #[tokio::test]
 async fn test_redirect_301_and_302_and_303_changes_post_to_get() {
@@ -11,7 +12,7 @@ async fn test_redirect_301_and_302_and_303_changes_post_to_get() {
     for &code in &codes {
         let redirect = server::http(move |req| async move {
             if req.method() == "POST" {
-                assert_eq!(req.uri(), &*format!("/{}", code));
+                assert_eq!(req.uri(), &*format!("/{code}"));
                 http::Response::builder()
                     .status(code)
                     .header("location", "/dst")
@@ -47,7 +48,7 @@ async fn test_redirect_307_and_308_tries_to_get_again() {
     for &code in &codes {
         let redirect = server::http(move |req| async move {
             assert_eq!(req.method(), "GET");
-            if req.uri() == &*format!("/{}", code) {
+            if req.uri() == &*format!("/{code}") {
                 http::Response::builder()
                     .status(code)
                     .header("location", "/dst")
@@ -86,10 +87,17 @@ async fn test_redirect_307_and_308_tries_to_post_again() {
             assert_eq!(req.method(), "POST");
             assert_eq!(req.headers()["content-length"], "5");
 
-            let data = req.body_mut().next().await.unwrap().unwrap();
+            let data = req
+                .body_mut()
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
             assert_eq!(&*data, b"Hello");
 
-            if req.uri() == &*format!("/{}", code) {
+            if req.uri() == &*format!("/{code}") {
                 http::Response::builder()
                     .status(code)
                     .header("location", "/dst")
@@ -133,7 +141,7 @@ async fn test_redirect_removes_sensitive_headers() {
             let mid_addr = rx.borrow().unwrap();
             assert_eq!(
                 req.headers()["referer"],
-                format!("http://{}/sensitive", mid_addr)
+                format!("http://{mid_addr}/sensitive")
             );
             http::Response::default()
         }
@@ -145,7 +153,7 @@ async fn test_redirect_removes_sensitive_headers() {
         assert_eq!(req.headers()["cookie"], "foo=bar");
         http::Response::builder()
             .status(302)
-            .header("location", format!("http://{}/end", end_addr))
+            .header("location", format!("http://{end_addr}/end"))
             .body(Body::default())
             .unwrap()
     });
@@ -155,7 +163,7 @@ async fn test_redirect_removes_sensitive_headers() {
     rquest::Client::builder()
         .build()
         .unwrap()
-        .get(&format!("http://{}/sensitive", mid_server.addr()))
+        .get(format!("http://{}/sensitive", mid_server.addr()))
         .header(
             rquest::header::COOKIE,
             rquest::header::HeaderValue::from_static("foo=bar"),
@@ -228,7 +236,7 @@ async fn test_referer_is_not_set_if_disabled() {
         .referer(false)
         .build()
         .unwrap()
-        .get(&format!("http://{}/no-refer", server.addr()))
+        .get(format!("http://{}/no-refer", server.addr()))
         .send()
         .await
         .unwrap();

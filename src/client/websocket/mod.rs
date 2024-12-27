@@ -12,7 +12,7 @@ use crate::{error::Kind, RequestBuilder};
 use crate::{Error, Response};
 use async_tungstenite::tungstenite;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use http::{header, HeaderValue, StatusCode, Version};
+use http::{header, HeaderName, HeaderValue, StatusCode, Version};
 pub use message::{CloseCode, Message};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::protocol::WebSocketConfig;
@@ -25,32 +25,46 @@ pub type WebSocketStream =
 #[derive(Debug)]
 pub struct WebSocketRequestBuilder {
     inner: RequestBuilder,
-    nonce: String,
+    nonce: Option<String>,
     protocols: Option<Vec<String>>,
     config: WebSocketConfig,
 }
 
 impl WebSocketRequestBuilder {
-    pub(crate) fn new_with_key(inner: RequestBuilder, key: String) -> Self {
-        Self::upgraded_request(inner, key)
-    }
-
     pub(crate) fn new(inner: RequestBuilder) -> Self {
-        Self::upgraded_request(inner, tungstenite::handshake::client::generate_key())
-    }
-
-    fn upgraded_request(inner: RequestBuilder, nonce: String) -> Self {
         Self {
-            inner,
-            nonce,
+            inner: inner.version(Version::HTTP_11),
+            nonce: None,
             protocols: None,
             config: WebSocketConfig::default(),
         }
     }
 
+    /// Websocket handshake with a specified websocket key. This returns a wrapped type,
+    /// so you must do this after you set up your request, and just before you send the
+    /// request.
+    pub fn key<K: Into<String>>(mut self, key: K) -> Self {
+        self.nonce = Some(key.into());
+        self
+    }
+
     /// Sets the websocket subprotocols to request.
     pub fn protocols(mut self, protocols: Vec<String>) -> Self {
-        self.protocols.as_mut().map(|p| p.extend(protocols));
+        if let Some(p) = self.protocols.as_mut() {
+            p.extend(protocols)
+        }
+        self
+    }
+
+    /// Add a set of Header to the existing ones on this Request.
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.inner = self.inner.header(key, value);
         self
     }
 
@@ -97,73 +111,61 @@ impl WebSocketRequestBuilder {
         let (client, request_result) = self.inner.build_split();
         let mut request = request_result?;
 
-        // change the scheme from wss? to https?
+        let nonce = self
+            .nonce
+            .unwrap_or_else(tungstenite::handshake::client::generate_key);
+
+        // change the scheme
         let url = request.url_mut();
         match url.scheme() {
-            "ws" => url
-                .set_scheme("http")
-                .expect("url should accept http scheme"),
-            "wss" => url
-                .set_scheme("https")
-                .expect("url should accept https scheme"),
-            _ => {
-                Err(Error::new(Kind::Builder, Some("invalid scheme")))?;
+            "ws" => {
+                url.set_scheme("http")
+                    .expect("url should accept http scheme");
+            }
+            "wss" => {
+                url.set_scheme("https")
+                    .expect("url should accept https scheme");
+            }
+            _ => {}
+        }
+
+        // HTTP 1 requires us to set some headers.
+        let headers = request.headers_mut();
+
+        headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(
+            header::SEC_WEBSOCKET_KEY,
+            HeaderValue::from_str(&nonce)
+                .map_err(|_| Error::new(Kind::Builder, Some("invalid key")))?,
+        );
+        headers.insert(
+            header::SEC_WEBSOCKET_VERSION,
+            HeaderValue::from_static("13"),
+        );
+
+        if let Some(ref protocols) = self.protocols {
+            // sets subprotocols
+            if !protocols.is_empty() {
+                let subprotocols = protocols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<&str>>()
+                    .join(", ");
+
+                request.headers_mut().insert(
+                    header::SEC_WEBSOCKET_PROTOCOL,
+                    subprotocols
+                        .parse()
+                        .map_err(|_| Error::new(Kind::Builder, Some("invalid subprotocol")))?,
+                );
             }
         }
 
-        // prepare request
-        let version = request.version();
-
-        match version {
-            Version::HTTP_10 | Version::HTTP_11 => {
-                // HTTP 1 requires us to set some headers.
-                let headers = request.headers_mut();
-
-                headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-                headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-                headers.insert(
-                    header::SEC_WEBSOCKET_KEY,
-                    HeaderValue::from_str(&self.nonce)
-                        .map_err(|_| Error::new(Kind::Builder, Some("invalid key")))?,
-                );
-                headers.insert(
-                    header::SEC_WEBSOCKET_VERSION,
-                    HeaderValue::from_static("13"),
-                );
-
-                if let Some(ref protocols) = self.protocols {
-                    // sets subprotocols
-                    if !protocols.is_empty() {
-                        let subprotocols = protocols
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<&str>>()
-                            .join(", ");
-
-                        request.headers_mut().insert(
-                            header::SEC_WEBSOCKET_PROTOCOL,
-                            subprotocols.parse().map_err(|_| {
-                                Error::new(Kind::Builder, Some("invalid subprotocol"))
-                            })?,
-                        );
-                    }
-                }
-            }
-
-            Version::HTTP_2 => {
-                // TODO: Implement websocket upgrade for HTTP 2.
-                return Err(Error::new(Kind::Builder, Some("HTTP2 not supported")).into());
-            }
-            _ => {
-                return Err(Error::new(Kind::Builder, Some("Unsupported HTTP version")).into());
-            }
-        };
-
         Ok(WebSocketResponse {
             inner: client.execute(request).await?,
-            nonce: self.nonce,
+            nonce,
             protocols: self.protocols,
-            version,
             config: self.config,
         })
     }
@@ -178,7 +180,6 @@ pub struct WebSocketResponse {
     inner: Response,
     nonce: String,
     protocols: Option<Vec<String>>,
-    version: Version,
     config: WebSocketConfig,
 }
 
@@ -204,7 +205,7 @@ impl WebSocketResponse {
             let headers = self.inner.headers();
 
             // Check the version
-            if self.inner.version() != self.version {
+            if !matches!(self.inner.version(), Version::HTTP_11 | Version::HTTP_10) {
                 return Err(Error::new(
                     Kind::Upgrade,
                     Some(format!("unexpected version: {:?}", self.inner.version())),
@@ -357,17 +358,13 @@ impl WebSocket {
     /// or [`CloseCode::Library(_)`]. Furthermore `reason` must be at most 123
     /// bytes long. Otherwise the call to [`close`][Self::close] will fail.
     pub async fn close(self, code: CloseCode, reason: Option<&str>) -> Result<(), Error> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut inner = self.inner;
-            inner
-                .close(Some(tungstenite::protocol::CloseFrame {
-                    code: code.into(),
-                    reason: reason.unwrap_or_default().into(),
-                }))
-                .await?;
-        }
-
+        let mut inner = self.inner;
+        inner
+            .close(Some(tungstenite::protocol::CloseFrame {
+                code: code.into(),
+                reason: reason.unwrap_or_default().into(),
+            }))
+            .await?;
         Ok(())
     }
 }

@@ -1,27 +1,26 @@
 # rquest
 
-[![Email Badge](https://img.shields.io/badge/Gmail-Contact_Me-green?logo=gmail)](mailto:gngppz@gmail.com)
 [![Crates.io License](https://img.shields.io/crates/l/rquest)](./LICENSE)
+![Crates.io MSRV](https://img.shields.io/crates/msrv/rquest)
 [![crates.io](https://img.shields.io/crates/v/rquest.svg)](https://crates.io/crates/rquest)
-[![Documentation](https://docs.rs/rquest/badge.svg)](https://docs.rs/rquest)
 [![Crates.io Total Downloads](https://img.shields.io/crates/d/rquest)](https://crates.io/crates/rquest)
 
-An ergonomic, all-in-one `TLS`/`JA3`/`JA4`/`HTTP2` fingerprint `HTTP`/`WebSocket` client.
+> 🚀 Help me work seamlessly with open source sharing by [sponsoring me on GitHub](https://github.com/penumbra-x/.github/blob/main/profile/SPONSOR.md)
 
-- Async Client
+An ergonomic, all-in-one `JA3`/`JA4`/`HTTP2` fingerprint `HTTP`/`WebSocket` client.
+
 - Plain, JSON, urlencoded, multipart bodies
-- Headers Order
-- Customizable redirect policy
+- Header Order
+- Redirect Policy
 - Cookie Store
 - HTTP Proxies
-- `HTTPS`/`WebSocket` via BoringSSL
-- Preconfigured `TLS`/`HTTP2`/`Headers` settings
-- [Changelog](https://github.com/penumbra-x/rquest/blob/main/CHANGELOG.md)
+- `HTTPS`/`WebSocket` via [BoringSSL](https://github.com/cloudflare/boring)
+- Preconfigured `TLS`/`HTTP2` settings
 
 Additional learning resources include:
 
 - [API Documentation](https://docs.rs/rquest)
-- [Repository Examples](https://github.com/penumbra-x/rqeust/tree/main/examples)
+- [Repository Examples](https://github.com/penumbra-x/rquest/tree/main/examples)
 
 ## Usage
 
@@ -33,18 +32,17 @@ HTTP
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rquest = "0.21"
+rquest = "1.0.0"
 ```
 
 ```rust,no_run
-use std::error::Error;
 use rquest::tls::Impersonate;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Build a client to mimic Chrome129
+async fn main() -> Result<(), rquest::Error> {
+    // Build a client to mimic Chrome131
     let client = rquest::Client::builder()
-        .impersonate(Impersonate::Chrome129)
+        .impersonate(Impersonate::Chrome131)
         .build()?;
 
     // Use the API you're already familiar with
@@ -60,22 +58,24 @@ WebSocket
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rquest = { version = "0.21", features = ["websocket"] }
+rquest = { version = "1.0.0", features = ["websocket"] }
+futures-util = { version = "0.3.0", default-features = false, features = ["std"] }
 ```
 
 ```rust,no_run
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use rquest::{tls::Impersonate, Client, Message};
-use std::error::Error;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let websocket = Client::builder()
-        .impersonate(Impersonate::Chrome127)
-        .http1_only()
-        .build()?
-        .get("wss://echo.websocket.org")
-        .upgrade()
+async fn main() -> Result<(), rquest::Error> {
+    // Build a client to mimic Chrome131
+    let client = Client::builder()
+        .impersonate(Impersonate::Chrome131)
+        .build()?;
+
+    // Use the API you're already familiar with
+    let websocket = client
+        .websocket("wss://echo.websocket.org")
         .send()
         .await?
         .into_websocket()
@@ -103,104 +103,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ```
 
-Preconfigured `TLS`/`HTTP2`
+> More examples can be found in the [examples](https://github.com/penumbra-x/rquest/tree/main/examples) directory.
 
-```toml
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-rquest = "0.21"
-```
+## Overview
 
-```rust
-use boring::ssl::{SslConnector, SslMethod};
-use http::{header, HeaderValue};
-use rquest::{
-    tls::{Http2Settings, ImpersonateSettings, TlsExtensionSettings},
-    HttpVersionPref,
-};
-use rquest::{PseudoOrder::*, SettingsOrder::*};
-use std::error::Error;
+The predecessor of rquest is [reqwest](https://github.com/seanmonstar/reqwest). rquest is a specialized adaptation based on the reqwest project, supporting [BoringSSL]() and related `HTTP/2` fingerprints in requests.
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    // Create a pre-configured TLS settings
-    let settings = ImpersonateSettings::builder()
-        .tls((
-            SslConnector::builder(SslMethod::tls_client())?,
-            TlsExtensionSettings::builder()
-                .tls_sni(true)
-                .http_version_pref(HttpVersionPref::Http2)
-                .application_settings(true)
-                .pre_shared_key(true)
-                .enable_ech_grease(true)
-                .permute_extensions(true)
-                .build(),
-        ))
-        .http2(
-            Http2Settings::builder()
-                .initial_stream_window_size(6291456)
-                .initial_connection_window_size(15728640)
-                .max_concurrent_streams(1000)
-                .max_header_list_size(262144)
-                .header_table_size(65536)
-                .enable_push(false)
-                .headers_priority((0, 255, true))
-                .headers_pseudo_order([Method, Scheme, Authority, Path])
-                .settings_order(vec![
-                    HeaderTableSize,
-                    EnablePush,
-                    MaxConcurrentStreams,
-                    InitialWindowSize,
-                    MaxFrameSize,
-                    MaxHeaderListSize,
-                    EnableConnectProtocol,
-                ])
-                .build(),
-        )
-        .headers(Box::new(|headers| {
-            headers.insert(header::USER_AGENT, HeaderValue::from_static("rquest"));
-        }))
-        .build();
+It also optimizes commonly used APIs and enhances compatibility with connection pools, making it easier to switch proxies, `IP` addresses, and interfaces. You can directly migrate from a project using reqwest to rquest.
 
-    // Build a client with pre-configured TLS settings
-    let client = rquest::Client::builder()
-        .use_preconfigured_tls(settings)
-        .build()?;
+Due to limited time for maintaining the synchronous APIs, only asynchronous APIs are supported. I may have to give up maintenance; if possible, please consider [sponsoring me](https://github.com/penumbra-x/.github/blob/main/profile/SPONSOR.md).
 
-    // Use the API you're already familiar with
-    let resp = client.get("https://tls.peet.ws/api/all").send().await?;
-    println!("{}", resp.text().await?);
+## Connection Pool
 
-    Ok(())
-}
+Regarding the design strategy of the connection pool, `rquest` and `reqwest` are implemented differently. `rquest` reconstructs the entire connection layer, treating each host with the same proxy or bound `IP`/`Interface` as the same connection, while `reqwest` treats each host as an independent connection. Specifically, the connection pool of `rquest` is managed based on the host and `proxy`/`IP`/`Interface`, while the connection pool of `reqwest` is managed only by the host. In other words, when using `rquest`, you can flexibly switch between proxies, `IP` or `Interface` without affecting the management of the connection pool.
 
-```
+> `Interface` refers to the network interface of the device, such as `wlan0` or `eth0`.
+
+## Root Certificate
+
+By default, `rquest` uses Mozilla's root certificates through the `webpki-roots` crate. This is a static root certificate bundle that is not automatically updated. It also ignores any root certificates installed on the host running `rquest`, which may be a good thing or a bad thing, depending on your point of view. But you can turn off `default-features` to cancel the default certificate bundle, and the system default certificate path will be used to load the certificate. In addition, `rquest` also provides a certificate store for users to customize the update certificate.
+
+- [source code details](https://github.com/penumbra-x/rquest/blob/main/examples/set_native_root_cert.rs)
 
 ## Device
 
-Currently supported impersonate device types
+You can customize the `TLS`/`HTTP2` fingerprint parameters of the device. In addition, the basic device impersonation types are provided as follows:
 
 - **Chrome**
 
-`Chrome100`，`Chrome101`，`Chrome104`，`Chrome105`，`Chrome106`，`Chrome107`，`Chrome108`，`Chrome109`，`Chrome114`，`Chrome116`，`Chrome117`，`Chrome118`，`Chrome119`，`Chrome120`，`Chrome123`，`Chrome124`，`Chrome126`，`Chrome127`，`Chrome128`，`Chrome129`
+`Chrome100`，`Chrome101`，`Chrome104`，`Chrome105`，`Chrome106`，`Chrome107`，`Chrome108`，`Chrome109`，`Chrome114`，`Chrome116`，`Chrome117`，`Chrome118`，`Chrome119`，`Chrome120`，`Chrome123`，`Chrome124`，`Chrome126`，`Chrome127`，`Chrome128`，`Chrome129`，`Chrome130`，`Chrome131`
 
 - **Edge**
 
-`Edge101`，`Edge122`，`Edge127`
+`Edge101`，`Edge122`，`Edge127`，`Edge131`
 
 - **Safari**
 
-`SafariIos17_2`，`SafariIos17_4_1`，`SafariIos16_5`，`Safari15_3`，`Safari15_5`，`Safari15_6_1`，`Safari16`，`Safari16_5`，`Safari17_0`，`Safari17_2_1`，`Safari17_4_1`，`Safari17_5`，`Safari18`，`SafariIPad18`
+`SafariIos17_2`，`SafariIos17_4_1`，`SafariIos16_5`，`Safari15_3`，`Safari15_5`，`Safari15_6_1`，`Safari16`，`Safari16_5`，`Safari17_0`，`Safari17_2_1`，`Safari17_4_1`，`Safari17_5`，`Safari18`，`SafariIPad18`, `Safari18_2`, `Safari18_1_1`
 
 - **OkHttp**
 
 `OkHttp3_9`，`OkHttp3_11`，`OkHttp3_13`，`OkHttp3_14`，`OkHttp4_9`，`OkHttp4_10`，`OkHttp5`
 
+- **Firefox**
+
+`Firefox109`, `Firefox133`
+
+> It is not supported for Firefox device that use http2 priority frames. If anyone is willing to help implement it, please submit a patch to the [h2](https://github.com/penumbra-x/h2) repository.
+
 ## Requirement
 
 Install the environment required to build [BoringSSL](https://github.com/google/boringssl/blob/master/BUILDING.md)
 
-Do not compile with crates that depend on OpenSSL; their prefixing symbols are the same and may cause linking [failures](https://github.com/rustls/rustls/issues/2010).
+Do not compile with crates that depend on `OpenSSL`; their prefixing symbols are the same and may cause linking [failures](https://github.com/rustls/rustls/issues/2010).
+
+If both `OpenSSL` and `BoringSSL` are used as dependencies simultaneously, even if the compilation succeeds, strange issues may still arise.
+
+If you prefer compiling for the `musl target`, it is recommended to use the [tikv-jemallocator](https://github.com/tikv/jemallocator) memory allocator; otherwise, multithreaded performance may be suboptimal. Only available in version 0.6.0, details: https://github.com/tikv/jemallocator/pull/70
 
 ## Building
 

@@ -1,7 +1,7 @@
 use std::fmt;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::into_url::{IntoUrl, IntoUrlSealed};
 use crate::Url;
@@ -95,7 +95,7 @@ pub struct NoProxy {
 /// A particular scheme used for proxying requests.
 ///
 /// For example, HTTP vs SOCKS5
-#[derive(Clone)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub enum ProxyScheme {
     Http {
         auth: Option<HeaderValue>,
@@ -277,9 +277,16 @@ impl Proxy {
     }
 
     pub(crate) fn system() -> Proxy {
-        let mut proxy = Proxy::new(Intercept::System(Arc::new(get_sys_proxies(
-            get_from_platform(),
-        ))));
+        static SYS_PROXIES: LazyLock<Arc<SystemProxyMap>> =
+            LazyLock::new(|| Arc::new(get_sys_proxies(get_from_platform())));
+
+        let mut proxy = if cfg!(feature = "internal_proxy_sys_no_cache") {
+            Proxy::new(Intercept::System(Arc::new(get_sys_proxies(
+                get_from_platform(),
+            ))))
+        } else {
+            Proxy::new(Intercept::System(SYS_PROXIES.clone()))
+        };
         proxy.no_proxy = NoProxy::from_env();
         proxy
     }
@@ -454,10 +461,10 @@ impl NoProxy {
     /// * If neither environment variable is set, `None` is returned
     /// * Entries are expected to be comma-separated (whitespace between entries is ignored)
     /// * IP addresses (both IPv4 and IPv6) are allowed, as are optional subnet masks (by adding /size,
-    /// for example "`192.168.1.0/24`").
+    ///   for example "`192.168.1.0/24`").
     /// * An entry "`*`" matches all hostnames (this is the only wildcard allowed)
     /// * Any other entry is considered a domain name (and may contain a leading dot, for example `google.com`
-    /// and `.google.com` are equivalent) and would match both that domain AND all subdomains.
+    ///   and `.google.com` are equivalent) and would match both that domain AND all subdomains.
     ///
     /// For example, if `"NO_PROXY=google.com, 192.168.1.0/24"` was set, all of the following would match
     /// (and therefore would bypass the proxy):
@@ -787,11 +794,13 @@ impl Intercept {
     }
 }
 
+type ProxyFunc = Arc<dyn Fn(&Url) -> Option<crate::Result<ProxyScheme>> + Send + Sync + 'static>;
+
 #[derive(Clone)]
 struct Custom {
     // This auth only applies if the returned ProxyScheme doesn't have an auth...
     auth: Option<HeaderValue>,
-    func: Arc<dyn Fn(&Url) -> Option<crate::Result<ProxyScheme>> + Send + Sync + 'static>,
+    func: ProxyFunc,
 }
 
 impl Custom {
@@ -823,7 +832,7 @@ pub(crate) fn encode_basic_auth(username: &str, password: &str) -> HeaderValue {
 }
 
 /// A helper trait to allow testing `Proxy::intercept` without having to
-/// construct `hyper::client::connect::Destination`s.
+/// construct `hyper2::client::connect::Destination`s.
 pub(crate) trait Dst {
     fn scheme(&self) -> &str;
     fn host(&self) -> &str;
@@ -842,6 +851,20 @@ impl Dst for Uri {
 
     fn port(&self) -> Option<u16> {
         self.port().map(|p| p.as_u16())
+    }
+}
+
+impl Dst for Url {
+    fn scheme(&self) -> &str {
+        self.scheme()
+    }
+
+    fn host(&self) -> &str {
+        self.host_str().expect("Url should have a host")
+    }
+
+    fn port(&self) -> Option<u16> {
+        self.port()
     }
 }
 
@@ -890,13 +913,6 @@ fn insert_proxy(proxies: &mut SystemProxyMap, scheme: impl Into<String>, addr: S
 
 fn get_from_environment() -> SystemProxyMap {
     let mut proxies = HashMap::new();
-
-    if !(insert_from_env(&mut proxies, "http", "ALL_PROXY")
-        && insert_from_env(&mut proxies, "https", "ALL_PROXY"))
-    {
-        insert_from_env(&mut proxies, "http", "all_proxy");
-        insert_from_env(&mut proxies, "https", "all_proxy");
-    }
 
     if !(insert_from_env(&mut proxies, "http", "ALL_PROXY")
         && insert_from_env(&mut proxies, "https", "ALL_PROXY"))
@@ -1073,7 +1089,7 @@ fn extract_type_prefix(address: &str) -> Option<&str> {
             None
         } else {
             let prefix = &address[..indice];
-            let contains_banned = prefix.contains(|c| c == ':' || c == '/');
+            let contains_banned = prefix.contains([':', '/']);
 
             if !contains_banned {
                 Some(prefix)

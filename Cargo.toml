@@ -1,17 +1,16 @@
 [package]
 name = "rquest"
-version = "0.21.20"
-description = "An ergonomic, all-in-one JA3/JA4/HTTP2 fingerprint HTTP/WebSocket client"
+version = "1.0.1"
+description = "Asynchronous Rust HTTP client with TLS, JA3/JA4, and HTTP2 fingerprint spoof"
 keywords = ["http", "client", "websocket", "ja3", "ja4"]
 categories = ["web-programming::http-client"]
-repository = "https://github.com/penumbra-x/rqeust"
+repository = "https://github.com/penumbra-x/rquest"
 documentation = "https://docs.rs/rquest"
 authors = ["0x676e67 <gngppz@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.80"
-autotests = true
 
 [package.metadata.docs.rs]
 all-features = true
@@ -19,71 +18,71 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
-default = ["boring-tls"]
+default = ["webpki-roots", "charset"]
 
 full = [
-    "boring-tls",
-    "gzip",
-    "brotli",
-    "zstd",
-    "deflate",
     "json",
     "stream",
     "cookies",
     "socks",
-    "hickory-dns",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate"
 ]
 
-websocket = ["async-tungstenite", "tokio-util/compat"]
+websocket = ["dep:async-tungstenite", "tokio-util/compat"]
 
-cookies = ["cookie_crate", "cookie_store"]
+charset = ["dep:encoding_rs"]
 
-gzip = ["async-compression", "async-compression/gzip", "tokio-util"]
+cookies = ["dep:cookie_crate", "dep:cookie_store"]
 
-brotli = ["async-compression", "async-compression/brotli", "tokio-util"]
+gzip = ["dep:async-compression", "async-compression?/gzip", "dep:tokio-util"]
 
-zstd = ["async-compression", "async-compression/zstd", "tokio-util"]
+brotli = ["dep:async-compression", "async-compression?/brotli", "dep:tokio-util"]
 
-deflate = ["async-compression", "async-compression/deflate", "tokio-util"]
+zstd = ["dep:async-compression", "async-compression?/zstd", "dep:tokio-util"]
 
-json = ["serde_json"]
+deflate = ["dep:async-compression", "async-compression?/zlib", "dep:tokio-util"]
 
-multipart = ["mime_guess"]
+json = ["dep:serde_json"]
 
-hickory-dns = ["hickory-resolver"]
+multipart = ["dep:mime_guess"]
 
-stream = ["tokio/fs", "tokio-util"]
+hickory-dns = ["dep:hickory-resolver"]
 
-socks = ["tokio-socks"]
+stream = ["tokio/fs", "dep:tokio-util"]
+
+socks = ["dep:tokio-socks"]
+
+native-roots = ["dep:rustls-native-certs"]
+webpki-roots = ["dep:webpki-root-certs"]
+
+# Optional disable internal proxy cache
+internal_proxy_sys_no_cache = []
+
+# Optional enable impersonate from str
+impersonate_str = []
+
+# Optional enable impersonate from settings
+impersonate_settings = []
 
 # Internal (PRIVATE!) features used to aid testing.
 # Don't rely on these whatsoever. They may disappear at anytime.
 
-# Enables common types used for TLS. Useless on its own.
-boring-tls = [
-    "dep:boring",
-    "dep:tokio-boring",
-    "dep:boring-sys",
-    "dep:foreign-types",
-    "dep:flate2",
-    "dep:brotli_crate",
-    "dep:libc",
-    "dep:linked_hash_set",
-    "dep:tower-layer",
-    "dep:antidote",
-    "dep:typed-builder",
-]
-
 [dependencies]
 base64 = "0.22"
-http = "0.2"
+http = "1"
 url = "2.5"
 bytes = "1.0"
 serde = "1.0"
 serde_urlencoded = "0.7.1"
+tower = { version = "0.5.0", default-features = false, features = ["timeout", "util"] }
 tower-service = "0.3"
 futures-core = { version = "0.3.0", default-features = false }
 futures-util = { version = "0.3.0", default-features = false }
+sync_wrapper = { version = "1.0", features = ["futures"] }
+antidote = { version = "1" }
 
 # Optional deps...
 
@@ -92,54 +91,52 @@ serde_json = { version = "1.0", optional = true }
 ## multipart
 mime_guess = { version = "2.0", default-features = false, optional = true }
 
-encoding_rs = "0.8"
-http-body = "0.4.6"
-hyper = { package = "rhyper", version = "0.14.40", default-features = false, features = [
-    "tcp",
-    "http1",
-    "http2",
-    "client",
-    "runtime",
-] }
-h2 = { package = "rh2", version = "0.3.40" }
+## common
+encoding_rs = { version = "0.8", optional = true }
+http-body = "1"
+http-body-util = "0.1"
+hyper2 = { version = "1", features = ["http1", "http2", "client"] }
 log = "0.4"
 mime = "0.3.17"
 percent-encoding = "2.3"
-tokio = { version = "1", default-features = false, features = ["net", "time"] }
+tokio = { version = "1", default-features = false, features = ["net", "time", "rt"] }
 pin-project-lite = "0.2.0"
 ipnet = "2.10.0"
+
+# hyper util
+socket2 = { version = "0.5", features = ["all"] }
+futures-channel = { version = "0.3" }
+lru = { version = "0.12", default-features = false }
 
 # Optional deps...
 
 ## boring-tls
-boring = { package = "rboring", version = "4", optional = true }
-boring-sys = { package = "rboring-sys", version = "4", optional = true }
-tokio-boring = { package = "tokio-rboring", version = "4", optional = true }
-foreign-types = { version = "0.5.0", optional = true }
-brotli_crate = { package = "brotli", version = "7", optional = true }
-flate2 = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
+boring = { package = "boring2", version = "4", features = ["pq-experimental"]}
+boring-sys = { package = "boring-sys2", version = "4" }
+tokio-boring = { package = "tokio-boring2", version = "4" }
+foreign-types = { version = "0.5.0" }
+typed-builder = { version = "0.20.0" }
 
 # boring-tls session cache
-linked_hash_set = { version = "0.1", optional = true }
-tower-layer = { version = "0.3", optional = true }
-antidote = { version = "1", optional = true }
+linked_hash_set = { version = "0.1" }
+tower-layer = { version = "0.3" }
 
-# boring-tls extension builder
-typed-builder = { version = "0.20.0", optional = true }
+# cert compression
+brotli = { version = "7" }
+flate2 = { version = "1" }
+zstd = { version = "0.13" }
+
+# tls root certs
+rustls-native-certs = { version = "0.8.0", optional = true }
+webpki-root-certs = { version = "0.26.0", optional = true }
 
 ## cookies
 cookie_crate = { version = "0.18", package = "cookie", optional = true }
 cookie_store = { version = "0.21", optional = true }
 
 ## compression
-async-compression = { version = "0.4.0", default-features = false, features = [
-    "tokio",
-], optional = true }
-tokio-util = { version = "0.7", default-features = false, features = [
-    "codec",
-    "io",
-], optional = true }
+async-compression = { version = "0.4.0", default-features = false, features = ["tokio"], optional = true }
+tokio-util = { version = "0.7.0", default-features = false, features = ["codec", "io"], optional = true }
 
 ## socks
 tokio-socks = { version = "0.5.2", optional = true }
@@ -148,9 +145,7 @@ tokio-socks = { version = "0.5.2", optional = true }
 async-tungstenite = { version = "0.28.0", optional = true }
 
 ## hickory-dns
-hickory-resolver = { version = "0.24", optional = true, features = [
-    "tokio-runtime",
-] }
+hickory-resolver = { version = "0.24", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.3.0"
@@ -159,25 +154,21 @@ windows-registry = "0.3.0"
 system-configuration = "0.6.0"
 
 [dev-dependencies]
+hyper = { version = "1.1.0", default-features = false, features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1.10", features = ["http1", "http2", "client", "client-legacy", "server-auto", "tokio"] }
 env_logger = "0.10.0"
-hyper = { package = "rhyper", version = "0.14", default-features = false, features = [
-    "tcp",
-    "stream",
-    "http1",
-    "http2",
-    "client",
-    "server",
-    "runtime",
-] }
 serde = { version = "1.0", features = ["derive"] }
 libflate = "2.0.0"
-zstd_crate = { package = "zstd", version = "0.13" }
+zstd = { version = "0.13" }
 doc-comment = "0.3"
 tokio = { version = "1.0", default-features = false, features = [
     "macros",
     "rt-multi-thread",
 ] }
-futures = { version = "0.3.0", default-features = false }
+futures = { version = "0.3.0", default-features = false, features = ["std"] }
+tower = { version = "0.5.2", default-features = false, features = ["limit"] }
+num_cpus = "1.0"
+libc = "0"
 
 [[example]]
 name = "json_dynamic"
@@ -207,34 +198,71 @@ name = "impersonate"
 path = "examples/impersonate.rs"
 
 [[example]]
-name = "impersonate_with_headers"
-path = "examples/impersonate_with_headers.rs"
+name = "hickory_dns"
+path = "examples/hickory_dns.rs"
+required-features = ["hickory-dns"]
 
 [[example]]
-name = "psk_impersonate"
-path = "examples/psk_impersonate.rs"
+name = "headers_order"
+path = "examples/headers_order.rs"
+required-features = ["cookies"]
+
+[[example]]
+name = "impersonate_skip_headers"
+path = "examples/impersonate_skip_headers.rs"
+
+[[example]]
+name = "impersonate_psk"
+path = "examples/impersonate_psk.rs"
+
+[[example]]
+name = "set_headers"
+path = "examples/set_headers.rs"
+
+[[example]]
+name = "set_cookies"
+path = "examples/set_cookies.rs"
+required-features = ["cookies"]
+
+[[example]]
+name = "set_cookie_provider"
+path = "examples/set_cookie_provider.rs"
+required-features = ["cookies"]
 
 [[example]]
 name = "set_proxies"
 path = "examples/set_proxies.rs"
-required-features = ["socks"]
+required-features = ["socks", "brotli"]
 
 [[example]]
 name = "set_local_address"
 path = "examples/set_local_address.rs"
+required-features = ["brotli"]
 
 [[example]]
 name = "set_interface"
 path = "examples/set_interface.rs"
+required-features = ["brotli"]
 
 [[example]]
-name = "set_ca_cert"
-path = "examples/set_ca_cert.rs"
+name = "set_native_root_cert"
+path = "examples/set_native_root_cert.rs"
+required-features = ["native-roots"]
+
+[[example]]
+name = "set_webpki_root_cert"
+path = "examples/set_webpki_root_cert.rs"
+required-features = ["webpki-roots"]
 
 [[example]]
 name = "websocket"
 path = "examples/websocket.rs"
-required-features = ["websocket"]
+required-features = ["websocket", "futures-util/std"]
+
+[[example]]
+name = "websocket_via_proxy"
+path = "examples/websocket_via_proxy.rs"
+required-features = ["websocket", "futures-util/std", "socks"]
 
 [[test]]
 name = "cookie"
@@ -257,6 +285,50 @@ path = "tests/deflate.rs"
 required-features = ["deflate"]
 
 [[test]]
+name = "zstd"
+path = "tests/zstd.rs"
+required-features = ["zstd", "stream"]
+
+[[test]]
 name = "multipart"
 path = "tests/multipart.rs"
 required-features = ["multipart"]
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
+required-features = ["full"]
+
+[[example]]
+name = "request_with_redirect"
+path = "examples/request_with_redirect.rs"
+required-features = ["full"]
+
+[[example]]
+name = "set_redirect"
+path = "examples/set_redirect.rs"
+required-features = ["full"]
+
+[[example]]
+name = "base_url"
+path = "examples/base_url.rs"
+
+[[example]]
+name = "request_with_cookie_store"
+path = "examples/request_with_cookie_store.rs"
+required-features = ["cookies"]
+
+[[example]]
+name = "request_with_version"
+path = "examples/request_with_version.rs"
+required-features = ["full"]
+
+[[example]]
+name = "request_with_proxy"
+path = "examples/request_with_proxy.rs"
+required-features = ["full"]
+
+[[example]]
+name = "connect_via_lower_priority_tokio_runtime"
+path = "examples/connect_via_lower_priority_tokio_runtime.rs"
+required-features = ["full"]

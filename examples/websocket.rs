@@ -1,10 +1,17 @@
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
-use rquest::Message;
-use std::error::Error;
+use rquest::{tls::Impersonate, Client, Message};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let websocket = rquest::websocket("wss://echo.websocket.org").await?;
+async fn main() -> Result<(), rquest::Error> {
+    // Build a client to mimic Chrome130
+    let websocket = Client::builder()
+        .impersonate(Impersonate::Chrome130)
+        .build()?
+        .websocket("wss://echo.websocket.org")
+        .send()
+        .await?
+        .into_websocket()
+        .await?;
 
     let (mut tx, mut rx) = websocket.split();
 
@@ -17,9 +24,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     while let Some(message) = rx.try_next().await? {
-        match message {
-            Message::Text(text) => println!("received: {text}"),
-            _ => {}
+        if let Message::Text(text) = message {
+            println!("received: {text}")
         }
     }
 

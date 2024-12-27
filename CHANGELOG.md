@@ -2,6 +2,544 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🚀 Features
+
+- *(client)* Add `no-keepalive` for `Client`
+
+### ⚙️ Miscellaneous Tasks
+
+- Argo clippy --fix
+
+## [1.0.0-rc.3] - 2024-12-25
+
+### 🚀 Features
+
+- Optional to enable impersonate customization (#217)
+
+### ⚡ Performance
+
+- Avoiding Unnecessary Copies (#219)
+
+### ⚙️ Miscellaneous Tasks
+
+- Remove unnecessary `Arc` wrapper from `redirect`/`base_url` (#216)
+- Update macros (#218)
+- Fix clippy accidentally deleted code (#220)
+- *(util/clent)* Remove extra clones
+
+## [1.0.0-rc.2] - 2024-12-24
+
+### 🚀 Features
+
+- Allow pluggable tower layers in connector service stack (#214)
+
+### 🐛 Bug Fixes
+
+- Propagate Body::size_hint when wrapping bodies (#213)
+
+### ⚙️ Miscellaneous Tasks
+
+- Cargo clippy --fix
+- Remove `new` method for `InnerRequestBuilder` (#212)
+- Remove `clone` from `Dst`
+
+## [1.0.0-rc.1] - 2024-12-24
+
+### 🚀 Features
+
+- Hyper v1 upgrade (#187)
+- Support request setting HTTP override ALPN (#188)
+- *(client)* Add the maximum safe retry count for HTTP/2 connections (#196)
+- *(client)* Export `http1`/`http2` Builder as public API (#199)
+- *(client)* Export `http1`/`http2` Builder as public API
+- *(body)* Improve interop with hyper for `Body` type
+- *(client)* Add impl `Service<http::Request<Body>>` for `Client` (#202)
+- *(client)* Request specific proxy override (#211)
+
+### 🐛 Bug Fixes
+
+- *(http2)* Fix http2 header frame initial `stream_id` settings (#185)
+- Fix http protocol auto-negotiation (#189)
+
+### ⚙️ Miscellaneous Tasks
+
+- Remove dead code (#182)
+- Macros simplify some debug implement (#183)
+- Static calc extension permutation (#184)
+- Cargo fmt --all
+- Remove unused code (#191)
+- *(pool)* Use `Mutex` types that do not poison themselves (#192)
+- Simplified TLS TCP stream abstraction (#193)
+- Cleaned up some unnecessary code (#194)
+- Remove unused code
+- Refactor connect mod
+- Refactor connect layer detail handle (#198)
+- Remove dead code
+- Use shorter feature name
+- Deleted permutation storage
+- Remove unused code
+- Remove unused code
+- Disable the exposure of internal connect dst API (#203)
+- Removed TLS config examples to prevent misconfigurations by inexperienced users (#205)
+- By default, impersonate from a string is disabled (#206)
+- *(tls)* Compile-time calculation of extended permutation (#207)
+- *(tls)* Disable custom TLS builder (#208)
+- Refactor connect network request extension (#210)
+
+### Deps
+
+- *(tokio-util)* V0.7.0 (#190)
+
+## [0.33.5] - 2024-12-19
+
+### 🚀 Features
+
+- *(client)* Http1 sends lowercase request headers by default to improve performance (#179)
+- Add `firefox 133` impersonate (#181)
+
+## [0.33.3] - 2024-12-16
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Fix `ws`/`wss` upgrade support for `http`/`https` proxy (#176)
+
+## [0.33.1] - 2024-12-16
+
+### ⚙️ Miscellaneous Tasks
+
+- Show clear errors when TLS connector build fails (#173)
+- Avoiding setup bloat when customizing your DNS resolver (#174)
+
+## [0.33.0] - 2024-12-15
+
+### 🚀 Features
+
+- Add `Safari 18.1.1` impersonate (#157)
+- Add `Edge 131` impersonate (#158)
+- *(client)* Add support for base URL parameter (#159)
+- *(client)* Add support for base URL parameter
+- Add loading of dynamic root certificate store (#170)
+- *(client)* Request specific cookie store override (#171)
+
+### 🐛 Bug Fixes
+
+- *(hickory-dns)* Fix initialization when `/etc/resolv.conf` is missing (#163)
+- *(client)* Return an error instead of panic when parsing invalid URL (#164)
+- *(connect)* Unnecessarily panic when parsing invalid URI (#166)
+
+### ⚙️ Miscellaneous Tasks
+
+- Do not pre-append `content-length` in non-header sorting state (#152)
+- Macro static creation of impersonate template (#156)
+- Update impersonate template
+- Update macro export scope
+- To avoid ambiguity, `ca_cert_store` is renamed to `root_certs_store` (#162)
+- Simplify root certificate load
+- Simplify root certificate load (#169)
+- Move `ImpersonateSettings` to implement location
+
+### ◀️ Revert
+
+- Remove `proxies_maybe_http_auth` state
+
+### Deps
+
+- *(async-tungstenite)* Downgrade `async-tungstenite` to `0.27.0` (#161)
+
+## [0.32.1] - 2024-12-12
+
+### 🚀 Features
+
+- Implement IntoUrl for Cow<'a, str> (#145)
+- Impl `IntoUrl` for `&Url` (#146)
+- *(client)* Request specific redirect policy override (#147)
+- *(redirect)* Expose method for accessing the previous and next request (#148)
+- Add `Safari 18.2` impersonate (#151)
+
+### 🚜 Refactor
+
+- Unified naming API (#150)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(client)* Client `set_redirect_policy` rename to `set_redirect` (#149)
+- Simplify the impersonate template
+
+## [0.31.11] - 2024-12-11
+
+### 🚀 Features
+
+- *(request)* Add `with_host_header` method for populating Host header (#142)
+- *(client)* Set `content-length` in advance for header sorting (#144)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(request)* Delete WASM legacy API (#141)
+- *(request)* Avoid panic when adding host header
+
+## [0.31.10] - 2024-12-10
+
+### 🐛 Bug Fixes
+
+- *(client)* Fix http redirect via proxy (#134)
+- *(client)* Fix redirect header sorting (#135)
+- *(client)* Fix redirect via connection pool extension (#137)
+- *(client)* Fix retry request via connection pool extension (#138)
+
+## [0.31.7] - 2024-12-10
+
+### 🚀 Features
+
+- *(client)* Add proxy management APIs: set, append, and clear proxies (#132)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(tls)* Rename `http_version_pref` to `alpn_protos` (#131)
+
+## [0.31.6] - 2024-12-09
+
+### ⚙️ Miscellaneous Tasks
+
+- Introduce macro for conditional header initialization (#127)
+- Fix typo
+
+## [0.31.5] - 2024-12-09
+
+### 🐛 Bug Fixes
+
+- *(connector)* Initialize pool key extension when creating a client (#126)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(client)* Accept request header is appended by default (#125)
+
+## [0.31.3] - 2024-12-09
+
+### 🚀 Features
+
+- *(client)* Add address/interface level connection pool (#123)
+
+### ⚙️ Miscellaneous Tasks
+
+- Refactor struct fields to use Cow<'static, T> for better efficiency (#124)
+- *(client)* Impersonate does not clone request headers unless necessary
+
+## [0.31.2] - 2024-12-08
+
+### 🚀 Features
+
+- *(client)* Support proxy-level connection pool (#122)
+
+### 🚜 Refactor
+
+- Do not create default request headers unless necessary (#120)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update
+- Cache template request headers (#121)
+
+## [0.31.0] - 2024-12-08
+
+### 🚀 Features
+
+- Support changing cookie provider after initialization (#114)
+- *(client)* Limit number of connections in pool (#118)
+
+### 🚜 Refactor
+
+- Reduce `unsafe` scope for improved safety and readability (#115)
+
+### ⚙️ Miscellaneous Tasks
+
+- Undo the dynamic distribution configuration headers (#111)
+- Disable dynamic distribution loading of certificates (#112)
+- Disable dynamic distribution loading of connector builder (#113)
+- Use custom connector builder
+- Inline some hot code
+- Reuse redirect policies whenever possible
+- Remove tunnel proxy user agent setting (#116)
+- Simplify pre-configured TLS settings
+- Simplify impersonate template
+- *(tls)* Export extension as public API
+
+### Build
+
+- Fix `android`/`fuchsia`/`linux` --no-default-features build (#110)
+
+## [0.30.5] - 2024-12-07
+
+### 🚀 Features
+
+- *(client)* Greatly improve the speed of creating clients (#108)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(tls)* Remove redundant settings (#109)
+
+## [0.30.0] - 2024-12-06
+
+### 🐛 Bug Fixes
+
+- Improve TLS connector creation, fix client creation taking too long (#107)
+
+## [0.29.9] - 2024-12-06
+
+### 🚀 Features
+
+- *(tls)* Dynamically configure WebSocket TLS connection alpn protos (#104)
+- *(client)* Added async client creation to reduce blocking of async runtime (#105)
+
+### ⚙️ Miscellaneous Tasks
+
+- Cargo clippy --fix (#106)
+
+## [0.29.0] - 2024-12-06
+
+### 🚀 Features
+
+- Support changing redirect policy after initialization (#102)
+- Support changing interface after initialization (#103)
+- Support changing interface after initialization
+
+## [0.28.5] - 2024-12-05
+
+### 🚀 Features
+
+- Support changing header order after initialization (#101)
+
+## [0.28.1] - 2024-12-05
+
+### 🚀 Features
+
+- Support changing impersonate fingerprint after initialization (#100)
+
+## [0.28.0] - 2024-12-05
+
+### 🚀 Features
+
+- Changing request headers after client initialization (#97)
+
+### 🐛 Bug Fixes
+
+- Fix decompressing deflate with zlib specific wrapper fails (#99)
+
+### 🚜 Refactor
+
+- Delete unnecessary clone (#98)
+
+## [0.27.7] - 2024-11-21
+
+### 🚀 Features
+
+- Add `Chrome 131` impersonate (#94)
+
+## [0.27.6] - 2024-11-15
+
+### 🚀 Features
+
+- *(proxy)* Optional disable internal proxy cache (#92)
+- Expose `hickory-resolver` as public API (#93)
+
+## [0.27.5] - 2024-11-05
+
+### 🚀 Features
+
+- Expose `tokio-boring` as public API (#88)
+
+### 🐛 Bug Fixes
+
+- *(tls)* Fix SNI verification (#87)
+
+## [0.27.3] - 2024-11-04
+
+### 🚀 Features
+
+- Optionl BoringSSL PQ experimental feature (#84)
+
+## [0.27.2] - 2024-11-01
+
+### 🚀 Features
+
+- *(tls)* Add option `session_ticket` extension (#79)
+- *(tls)* Implement Debug for TlsSettings (#80)
+- *(tls)* Update session ticket setting
+- *(tls)* No additional WebSocket connector is needed for HTTP/1 client (#81)
+
+## [0.27.1] - 2024-11-01
+
+### 🚀 Features
+
+- *(http2)* Exposing Http2Settings fields (#75)
+- *(tls)* Expose more custom TL settings (#76)
+- *(client)* Optional configuration of Client TLS extension (#78)
+
+### 🚜 Refactor
+
+- Integrate tls/http2 unified configuration module (#77)
+
+## [0.27.0] - 2024-10-31
+
+### Deps
+
+- *(hyper)* Bump version to v0.14.60 (#74)
+
+## [0.26.3] - 2024-10-30
+
+### 🚀 Features
+
+- *(http2)* Add `http2_max_frame_size` settings (#73)
+
+## [0.26.2] - 2024-10-27
+
+### 🚜 Refactor
+
+- *(tls)* Refactor internal `TLS`/`HTTP2` module (#69)
+- *(tls)* Simplified TLS version mappr (#70)
+- *(impersonate)* Simplify Impersonate enum parsing with macro (#71)
+
+## [0.26.1] - 2024-10-26
+
+### 🚀 Features
+
+- *(tls)* Simplify TLS version settings (#66)
+
+### 🐛 Bug Fixes
+
+- Update Chrome version from 129 to 130 (#68)
+
+### 📚 Documentation
+
+- Improve `TLS`/`HTTP2` custom configuration documentation (#67)
+
+## [0.26.0] - 2024-10-25
+
+### 🚀 Features
+
+- *(impersonate)* Add Chrome 130 impersonate (#65)
+
+### 🚜 Refactor
+
+- Normalize DNS module exports (#64)
+
+## [0.25.7] - 2024-10-25
+
+### 🚀 Features
+
+- *(client)* Default send header names as title case (only http1) (#61)
+
+### Deps
+
+- *(h2)* Use h2 dependencies export by hyper (#63)
+
+## [0.25.6] - 2024-10-24
+
+### 🚀 Features
+
+- *(dns)* Export dns resolver `HickoryDnsResolver` (#55)
+
+### 🐛 Bug Fixes
+
+- *(http)* Compatible with some CDN servers, Http1 retains case by default when sending headers(#56)
+
+### 📚 Documentation
+
+- Update docs (#54)
+
+### Deps
+
+- Remove unnecessary libc dependencies (#53)
+
+## [0.25.5] - 2024-10-23
+
+### 🐛 Bug Fixes
+
+- *(tls)* Fix unsafe code block warnings (#52)
+
+## [0.25.2] - 2024-10-23
+
+### 🚀 Features
+
+- *(websocket)* Add websocket handshake with a specified websocket key (#50)
+
+### 🐛 Bug Fixes
+
+- *(client)* Fix `ClientBuilder` not `Send` + `Sync` (#51)
+
+## [0.25.1] - 2024-10-22
+
+### 🚀 Features
+
+- *(websocket)* Improve websocket API usage (#49)
+
+## [0.25.0] - 2024-10-22
+
+### 🚀 Features
+
+- *(client)* Adaptively select and upgrade the websocket connector (#48)
+
+## [0.23.3] - 2024-10-17
+
+### 🚜 Refactor
+
+- *(tls)* Simplify TLS custom settings (#46)
+
+## [0.23.2] - 2024-10-16
+
+### Deps
+
+- *(hyper)* Bump version to v0.14.50 (#45)
+
+## [0.23.1] - 2024-10-16
+
+### 🚀 Features
+
+- Improve header sort (#43)
+- Improve unnecessary header sorting storage overhead (#44)
+
+## [0.23.0] - 2024-10-13
+
+### 🚀 Features
+
+- *(tls)* Optional webpki root certificates feature (#40)
+
+### 🐛 Bug Fixes
+
+- *(tls)* Fix CA certificate conditional compilation (#41)
+
+### 🚜 Refactor
+
+- *(tls)* Public and reuse tls/http2 templates (#42)
+
+## [0.22.2] - 2024-10-12
+
+### 🚀 Features
+
+- *(tls)* Avoid repeated loading of native root CA (#37)
+
+### 🚜 Refactor
+
+- Refactor custom root CA certificate loading source (#38)
+
+## [0.22.1] - 2024-10-12
+
+### 🚀 Features
+
+- *(tls)* Optional built-in root certificates feature (#36)
+
+## [0.22.0] - 2024-10-11
+
+### 🚀 Features
+
+- Add file function to async::multipart (#32)
+- *(dns)* Optional `LookupIpStrategy` for `hickory_dns` (#33)
+
+### 🚜 Refactor
+
+- *(client)* Removed confusing way to enable `hickory-dns` (#34)
+
 ## [0.21.20] - 2024-10-10
 
 ### 🚀 Features

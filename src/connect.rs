@@ -1,177 +1,226 @@
-#[cfg(feature = "boring-tls")]
-use self::boring_tls_conn::BoringTlsConn;
-#[cfg(feature = "boring-tls")]
-use crate::tls::{BoringTlsConnector, MaybeHttpsStream};
-#[cfg(feature = "boring-tls")]
-use http::header::HeaderValue;
-use http::uri::{Authority, Scheme};
-use http::Uri;
-use hyper::client::connect::{Connected, Connection};
-use hyper::service::Service;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
+use self::tls_conn::BoringTlsConn;
+use crate::tls::{BoringTlsConnector, HttpsConnector, MaybeHttpsStream};
+use crate::util::client::connect::{Connected, Connection};
+use crate::util::client::Dst;
+use crate::util::rt::TokioIo;
+use crate::util::{self, into_uri};
+use antidote::RwLock;
+use http::uri::Scheme;
+use hyper2::rt::{Read, ReadBufCursor, Write};
 use pin_project_lite::pin_project;
+use sealed::{Conn, Unnameable};
+use tokio_boring::SslStream;
+use tower::util::{BoxCloneSyncServiceLayer, MapRequestLayer};
+use tower::{timeout::TimeoutLayer, util::BoxCloneSyncService, ServiceBuilder};
+use tower_service::Service;
+
 use std::future::Future;
 use std::io::{self, IoSlice};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::dns::DynResolver;
-use crate::error::BoxError;
-use crate::proxy::{Proxy, ProxyScheme};
+use crate::error::{cast_to_internal_error, BoxError};
+use crate::proxy::ProxyScheme;
 
-pub(crate) type HttpConnector = hyper::client::HttpConnector<DynResolver>;
+pub(crate) type HttpConnector = util::client::connect::HttpConnector<DynResolver>;
 
-#[derive(Clone)]
-pub(crate) struct Connector {
-    inner: Inner,
-    proxies: Arc<Vec<Proxy>>,
+pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, BoxError>;
+
+pub(crate) type BoxedConnectorLayer =
+    BoxCloneSyncServiceLayer<BoxedConnectorService, Unnameable, Conn, BoxError>;
+
+pub(crate) struct ConnectorBuilder {
+    http: HttpConnector,
+    tls: BoringTlsConnector,
     verbose: verbose::Wrapper,
     timeout: Option<Duration>,
-    #[cfg(feature = "boring-tls")]
     nodelay: bool,
-    #[cfg(feature = "boring-tls")]
     tls_info: bool,
-    #[cfg(feature = "boring-tls")]
-    user_agent: Option<HeaderValue>,
 }
 
-#[derive(Clone)]
-enum Inner {
-    #[cfg(not(feature = "boring-tls"))]
-    Http(HttpConnector),
-    #[cfg(feature = "boring-tls")]
-    BoringTls {
-        http: HttpConnector,
-        tls: BoringTlsConnector,
-    },
-}
-
-impl Connector {
-    #[cfg(not(feature = "boring-tls"))]
-    pub fn new(
-        mut http: HttpConnector,
-        proxies: Arc<Vec<Proxy>>,
-        local_addr_v4: Option<Ipv4Addr>,
-        local_addr_v6: Option<Ipv6Addr>,
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        interface: Option<&str>,
-        nodelay: bool,
-    ) -> Connector {
-        match (local_addr_v4, local_addr_v6) {
-            (Some(v4), Some(v6)) => http.set_local_addresses(v4, v6),
-            (Some(v4), None) => http.set_local_address(Some(IpAddr::from(v4))),
-            (None, Some(v6)) => http.set_local_address(Some(IpAddr::from(v6))),
-            _ => {}
+impl ConnectorBuilder {
+    pub(crate) fn build(self, layers: Vec<BoxedConnectorLayer>) -> Connector {
+        if layers.is_empty() {
+            // we have no user-provided layers, only use concrete types
+            let base_service = ConnectorService {
+                http: self.http,
+                tls: InnerTLS::Simple(self.tls),
+                verbose: self.verbose,
+                nodelay: self.nodelay,
+                tls_info: self.tls_info,
+                timeout: self.timeout,
+            };
+            return Connector::Simple(base_service);
         }
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        if let Some(interface) = interface {
-            http.set_interface(interface);
-        }
-        http.set_nodelay(nodelay);
 
-        Connector {
-            inner: Inner::Http(http),
-            proxies,
-            verbose: verbose::OFF,
-            timeout: None,
+        let inner_tls = InnerTLS::WithSharedState(Arc::new(RwLock::new(self.tls)));
+        let mut base_service = ConnectorService {
+            http: self.http,
+            tls: inner_tls.clone(),
+            verbose: self.verbose,
+            nodelay: self.nodelay,
+            tls_info: self.tls_info,
+            timeout: self.timeout,
+        };
+
+        // If layers is empty, we have no timeout
+        let timeout = base_service.timeout.take();
+
+        // otherwise we have user provided layers
+        // so we need type erasure all the way through
+        // as well as mapping the unnameable type of the layers back to Dst for the inner service
+        let unnameable_service = ServiceBuilder::new()
+            .layer(MapRequestLayer::new(|request: Unnameable| request.0))
+            .service(base_service);
+        let mut service = BoxCloneSyncService::new(unnameable_service);
+        for layer in layers {
+            service = ServiceBuilder::new().layer(layer).service(service);
+        }
+
+        // now we handle the concrete stuff - any `connect_timeout`,
+        // plus a final map_err layer we can use to cast default tower layer
+        // errors to internal errors
+        match timeout {
+            Some(timeout) => {
+                let service = ServiceBuilder::new()
+                    .layer(TimeoutLayer::new(timeout))
+                    .service(service);
+                let service = ServiceBuilder::new()
+                    .map_err(cast_to_internal_error)
+                    .service(service);
+                let service = BoxCloneSyncService::new(service);
+                Connector::WithLayers { inner_tls, service }
+            }
+            None => {
+                // no timeout, but still map err
+                // no named timeout layer but we still map errors since
+                // we might have user-provided timeout layer
+                let service = ServiceBuilder::new().service(service);
+                let service = ServiceBuilder::new()
+                    .map_err(cast_to_internal_error)
+                    .service(service);
+                let service = BoxCloneSyncService::new(service);
+                Connector::WithLayers { inner_tls, service }
+            }
         }
     }
 
-    #[cfg(feature = "boring-tls")]
-    pub(crate) fn new_boring_tls(
+    pub(crate) fn new(
         mut http: HttpConnector,
         tls: BoringTlsConnector,
-        proxies: Arc<Vec<Proxy>>,
-        user_agent: Option<HeaderValue>,
-        local_addr_v4: Option<Ipv4Addr>,
-        local_addr_v6: Option<Ipv6Addr>,
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        interface: Option<&str>,
         nodelay: bool,
         tls_info: bool,
-    ) -> Connector {
-        match (local_addr_v4, local_addr_v6) {
-            (Some(v4), Some(v6)) => http.set_local_addresses(v4, v6),
-            (Some(v4), None) => http.set_local_address(Some(IpAddr::from(v4))),
-            (None, Some(v6)) => http.set_local_address(Some(IpAddr::from(v6))),
-            _ => {}
-        }
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        if let Some(interface) = interface {
-            http.set_interface(interface);
-        }
+    ) -> ConnectorBuilder {
         http.enforce_http(false);
-
-        Connector {
-            inner: Inner::BoringTls { http, tls },
-            proxies,
+        ConnectorBuilder {
+            http,
+            tls,
             verbose: verbose::OFF,
             timeout: None,
             nodelay,
-            user_agent,
             tls_info,
         }
     }
 
+    #[inline]
     pub(crate) fn set_keepalive(&mut self, dur: Option<Duration>) {
-        match &mut self.inner {
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(http) => http.set_keepalive(dur),
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, .. } => http.set_keepalive(dur),
-        }
+        self.http.set_keepalive(dur);
     }
 
+    #[inline]
     pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
 
+    #[inline]
     pub(crate) fn set_verbose(&mut self, enabled: bool) {
         self.verbose.0 = enabled;
     }
+}
 
-    pub(crate) fn get_proxies(&self) -> Arc<Vec<Proxy>> {
-        self.proxies.clone()
+#[derive(Clone)]
+pub(crate) enum Connector {
+    // base service, with or without an embedded timeout
+    Simple(ConnectorService),
+    // at least one custom layer along with maybe an outer timeout layer
+    // from `builder.connect_timeout()`
+    WithLayers {
+        inner_tls: InnerTLS,
+        service: BoxedConnectorService,
+    },
+}
+
+impl Connector {
+    #[inline]
+    pub(crate) fn set_connector(&mut self, mut connector: BoringTlsConnector) {
+        match self {
+            Connector::Simple(service) => {
+                std::mem::swap(&mut service.tls, &mut InnerTLS::Simple(connector));
+            }
+            Connector::WithLayers { inner_tls, .. } => {
+                if let InnerTLS::WithSharedState(tls) = inner_tls {
+                    std::mem::swap(&mut *tls.write(), &mut connector);
+                }
+            }
+        }
     }
+}
 
-    pub(crate) fn set_proxies(&mut self, proxies: &[Proxy]) {
-        Arc::make_mut(&mut self.proxies).clone_from_slice(proxies);
-    }
+impl Service<Dst> for Connector {
+    type Response = Conn;
+    type Error = BoxError;
+    type Future = Connecting;
 
-    pub(crate) fn set_local_address(&mut self, addr: Option<IpAddr>) {
-        match &mut self.inner {
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(http) => http.set_local_address(addr),
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, .. } => http.set_local_address(addr),
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self {
+            Connector::Simple(service) => service.poll_ready(cx),
+            Connector::WithLayers { service, .. } => service.poll_ready(cx),
         }
     }
 
-    pub(crate) fn set_local_addresses(&mut self, addr_ipv4: Ipv4Addr, addr_ipv6: Ipv6Addr) {
-        match &mut self.inner {
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(http) => http.set_local_addresses(addr_ipv4, addr_ipv6),
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, .. } => http.set_local_addresses(addr_ipv4, addr_ipv6),
+    fn call(&mut self, dst: Dst) -> Self::Future {
+        match self {
+            Connector::Simple(service) => service.call(dst),
+            Connector::WithLayers { service, .. } => service.call(Unnameable(dst)),
         }
     }
+}
 
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    pub(crate) fn set_interface(&mut self, interface: &str) {
-        match &mut self.inner {
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(http) => http.set_interface(interface),
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, .. } => http.set_interface(interface),
-        };
+#[derive(Clone)]
+pub(crate) enum InnerTLS {
+    Simple(BoringTlsConnector),
+    WithSharedState(Arc<RwLock<BoringTlsConnector>>),
+}
+
+impl InnerTLS {
+    fn get_tls(&self) -> BoringTlsConnector {
+        match self {
+            InnerTLS::Simple(tls) => tls.clone(),
+            InnerTLS::WithSharedState(tls) => tls.read().clone(),
+        }
     }
+}
 
+#[derive(Clone)]
+pub(crate) struct ConnectorService {
+    http: HttpConnector,
+    tls: InnerTLS,
+    verbose: verbose::Wrapper,
+    /// When there is a single timeout layer and no other layers,
+    /// we embed it directly inside our base Service::call().
+    /// This lets us avoid an extra `Box::pin` indirection layer
+    /// since `tokio::time::Timeout` is `Unpin`
+    timeout: Option<Duration>,
+    nodelay: bool,
+    tls_info: bool,
+}
+
+impl ConnectorService {
     #[cfg(feature = "socks")]
-    async fn connect_socks(&self, dst: Uri, proxy: ProxyScheme) -> Result<Conn, BoxError> {
+    async fn connect_socks(&self, mut dst: Dst, proxy: ProxyScheme) -> Result<Conn, BoxError> {
         let dns = match proxy {
             ProxyScheme::Socks4 { .. } => socks::DnsResolve::Local,
             ProxyScheme::Socks5 {
@@ -185,140 +234,122 @@ impl Connector {
             }
         };
 
-        match &self.inner {
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, tls, .. } => {
-                if dst.scheme() == Some(&Scheme::HTTPS) {
-                    let host = dst.host().ok_or("no host in url")?;
-                    let conn = socks::connect(proxy, dst.clone(), dns).await?;
-                    let connector = tls.from(http.clone()).await;
-                    let setup_ssl = connector.setup_ssl(&dst, host)?;
-                    let io = tokio_boring::SslStreamBuilder::new(setup_ssl, conn)
-                        .connect()
-                        .await?;
-                    return Ok(Conn {
-                        inner: self.verbose.wrap(BoringTlsConn { inner: io }),
-                        is_proxy: false,
-                        tls_info: self.tls_info,
-                    });
-                }
-            }
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(_) => (),
+        if dst.scheme() == Some(&Scheme::HTTPS) {
+            let http = HttpsConnector::builder(self.http.clone())
+                .with_version_pref(dst.version_pref())
+                .with_iface(dst.take_iface())
+                .build(self.tls.get_tls());
+
+            log::trace!("socks HTTPS over proxy");
+            let host = dst.host().ok_or(crate::error::uri_bad_host())?;
+            let conn = socks::connect(proxy, &dst, dns).await?;
+
+            let io = http.connect(&dst, host, TokioIo::new(conn)).await?;
+
+            return Ok(Conn {
+                inner: self.verbose.wrap(BoringTlsConn {
+                    inner: TokioIo::new(io),
+                }),
+                is_proxy: false,
+                tls_info: self.tls_info,
+            });
         }
 
-        socks::connect(proxy, dst, dns).await.map(|tcp| Conn {
-            inner: self.verbose.wrap(tcp),
+        socks::connect(proxy, &dst, dns).await.map(|tcp| Conn {
+            inner: self.verbose.wrap(TokioIo::new(tcp)),
             is_proxy: false,
             tls_info: false,
         })
     }
 
-    async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
-        match self.inner {
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(mut http) => {
-                let io = http.call(dst).await?;
-                Ok(Conn {
-                    inner: self.verbose.wrap(io),
-                    is_proxy,
-                    tls_info: false,
-                })
+    async fn connect_with_maybe_proxy(
+        self,
+        mut dst: Dst,
+        is_proxy: bool,
+    ) -> Result<Conn, BoxError> {
+        let mut http = self.http.clone();
+
+        // Disable Nagle's algorithm for TLS handshake
+        //
+        // https://www.openssl.org/docs/man1.1.1/man3/SSL_connect.html#NOTES
+        if !self.nodelay && (dst.scheme() == Some(&Scheme::HTTPS)) {
+            http.set_nodelay(true);
+        }
+
+        log::trace!("connect with maybe proxy");
+        let mut http = HttpsConnector::builder(http)
+            .with_version_pref(dst.version_pref())
+            .with_iface(dst.take_iface())
+            .build(self.tls.get_tls());
+        let io = http.call(dst.into()).await?;
+
+        if let MaybeHttpsStream::Https(stream) = io {
+            if !self.nodelay {
+                stream
+                    .inner()
+                    .get_ref()
+                    .inner()
+                    .inner()
+                    .set_nodelay(false)?;
             }
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, tls } => {
-                let mut http = http.clone();
-
-                // Disable Nagle's algorithm for TLS handshake
-                //
-                // https://www.openssl.org/docs/man1.1.1/man3/SSL_connect.html#NOTES
-                if !self.nodelay && (dst.scheme() == Some(&Scheme::HTTPS)) {
-                    http.set_nodelay(true);
-                }
-
-                let mut http = tls.from(http).await;
-                let io = http.call(dst).await?;
-
-                if let MaybeHttpsStream::Https(stream) = io {
-                    if !self.nodelay {
-                        let stream_ref = stream.get_ref();
-                        stream_ref.set_nodelay(false)?;
-                    }
-                    Ok(Conn {
-                        inner: self.verbose.wrap(BoringTlsConn { inner: stream }),
-                        is_proxy,
-                        tls_info: self.tls_info,
-                    })
-                } else {
-                    Ok(Conn {
-                        inner: self.verbose.wrap(io),
-                        is_proxy,
-                        tls_info: self.tls_info,
-                    })
-                }
-            }
+            Ok(Conn {
+                inner: self.verbose.wrap(BoringTlsConn { inner: stream }),
+                is_proxy,
+                tls_info: self.tls_info,
+            })
+        } else {
+            Ok(Conn {
+                inner: self.verbose.wrap(io),
+                is_proxy,
+                tls_info: self.tls_info,
+            })
         }
     }
 
     async fn connect_via_proxy(
         self,
-        dst: Uri,
+        mut dst: Dst,
         proxy_scheme: ProxyScheme,
     ) -> Result<Conn, BoxError> {
         log::debug!("proxy({:?}) intercepts '{:?}'", proxy_scheme, dst);
 
-        let (proxy_dst, _auth) = match proxy_scheme {
-            ProxyScheme::Http { host, auth } => (into_uri(Scheme::HTTP, host), auth),
-            ProxyScheme::Https { host, auth } => (into_uri(Scheme::HTTPS, host), auth),
+        let (proxy_dst, auth) = match proxy_scheme {
+            ProxyScheme::Http { host, auth } => (into_uri(Scheme::HTTP, host)?, auth),
+            ProxyScheme::Https { host, auth } => (into_uri(Scheme::HTTPS, host)?, auth),
             #[cfg(feature = "socks")]
-            ProxyScheme::Socks4 { .. } => return self.connect_socks(dst, proxy_scheme).await,
-            #[cfg(feature = "socks")]
-            ProxyScheme::Socks5 { .. } => return self.connect_socks(dst, proxy_scheme).await,
+            ProxyScheme::Socks4 { .. } | ProxyScheme::Socks5 { .. } => {
+                return self.connect_socks(dst, proxy_scheme).await;
+            }
         };
 
-        #[cfg(feature = "boring-tls")]
-        let auth = _auth;
+        if dst.scheme() == Some(&Scheme::HTTPS) {
+            let mut http = HttpsConnector::builder(self.http.clone())
+                .with_version_pref(dst.version_pref())
+                .with_iface(dst.take_iface())
+                .build(self.tls.get_tls());
 
-        match &self.inner {
-            #[cfg(feature = "boring-tls")]
-            Inner::BoringTls { http, tls } => {
-                if dst.scheme() == Some(&Scheme::HTTPS) {
-                    let host = dst.host().ok_or("no host in url")?;
-                    let port = dst.port().map(|p| p.as_u16()).unwrap_or(443);
+            let host = dst.host().ok_or(crate::error::uri_bad_host())?;
+            let port = dst.port_u16().unwrap_or(443);
 
-                    let mut http = tls.from(http.clone()).await;
-                    let conn = http.call(proxy_dst).await?;
-                    log::trace!("tunneling HTTPS over proxy");
-                    let tunneled = tunnel(conn, host, port, self.user_agent.as_ref(), auth).await?;
+            log::trace!("tunneling HTTPS over proxy");
+            let conn = http.call(proxy_dst).await?;
+            let tunneled = tunnel::connect(conn, host, port, auth).await?;
 
-                    let ssl = http.setup_ssl(&dst, host)?;
-                    let io = tokio_boring::SslStreamBuilder::new(ssl, tunneled)
-                        .connect()
-                        .await?;
+            let io = http.connect(&dst, host, tunneled).await?;
 
-                    return Ok(Conn {
-                        inner: self.verbose.wrap(BoringTlsConn { inner: io }),
-                        is_proxy: false,
-                        tls_info: self.tls_info,
-                    });
-                }
-            }
-            #[cfg(not(feature = "boring-tls"))]
-            Inner::Http(_) => (),
+            return Ok(Conn {
+                inner: self.verbose.wrap(BoringTlsConn {
+                    inner: TokioIo::new(io),
+                }),
+                is_proxy: false,
+                tls_info: self.tls_info,
+            });
         }
 
-        self.connect_with_maybe_proxy(proxy_dst, true).await
-    }
-}
+        dst.set_dst(proxy_dst);
 
-fn into_uri(scheme: Scheme, host: Authority) -> Uri {
-    // TODO: Should the `http` crate get `From<(Scheme, Authority)> for Uri`?
-    Uri::builder()
-        .scheme(scheme)
-        .authority(host)
-        .path_and_query(http::uri::PathAndQuery::from_static("/"))
-        .build()
-        .expect("scheme and authority is valid Uri")
+        self.connect_with_maybe_proxy(dst, true).await
+    }
 }
 
 async fn with_timeout<T, F>(f: F, timeout: Option<Duration>) -> Result<T, BoxError>
@@ -336,7 +367,7 @@ where
     }
 }
 
-impl Service<Uri> for Connector {
+impl Service<Dst> for ConnectorService {
     type Response = Conn;
     type Error = BoxError;
     type Future = Connecting;
@@ -345,295 +376,146 @@ impl Service<Uri> for Connector {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, dst: Uri) -> Self::Future {
+    fn call(&mut self, mut dst: Dst) -> Self::Future {
         log::debug!("starting new connection: {:?}", dst);
-        let timeout = self.timeout;
-        for prox in self.proxies.iter() {
-            if let Some(proxy_scheme) = prox.intercept(&dst) {
-                return Box::pin(with_timeout(
-                    self.clone().connect_via_proxy(dst, proxy_scheme),
-                    timeout,
-                ));
-            }
+
+        if let Some(proxy_scheme) = dst.take_proxy() {
+            return Box::pin(with_timeout(
+                self.clone().connect_via_proxy(dst, proxy_scheme),
+                self.timeout,
+            ));
         }
 
         Box::pin(with_timeout(
             self.clone().connect_with_maybe_proxy(dst, false),
-            timeout,
+            self.timeout,
         ))
     }
 }
 
-#[cfg(feature = "boring-tls")]
 trait TlsInfoFactory {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo>;
 }
 
-#[cfg(feature = "boring-tls")]
-impl TlsInfoFactory for BoringTlsConn<tokio::net::TcpStream> {
+impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .inner
-            .ssl()
-            .peer_certificate()
-            .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        self.inner().tls_info()
     }
 }
 
-#[cfg(feature = "boring-tls")]
-impl TlsInfoFactory for MaybeHttpsStream<tokio::net::TcpStream> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        match self {
-            MaybeHttpsStream::Https(tls) => {
-                let peer_certificate = tls.ssl().peer_certificate().and_then(|c| c.to_der().ok());
-                Some(crate::tls::TlsInfo { peer_certificate })
-            }
-            MaybeHttpsStream::Http(_) => None,
-        }
-    }
-}
-
-#[cfg(feature = "boring-tls")]
-impl TlsInfoFactory for BoringTlsConn<MaybeHttpsStream<tokio::net::TcpStream>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        match self.inner.get_ref() {
-            MaybeHttpsStream::Https(ref tls) => {
-                let peer_certificate = tls.ssl().peer_certificate().and_then(|c| c.to_der().ok());
-                Some(crate::tls::TlsInfo { peer_certificate })
-            }
-            MaybeHttpsStream::Http(_) => None,
-        }
-    }
-}
-
-#[cfg(feature = "boring-tls")]
 impl TlsInfoFactory for tokio::net::TcpStream {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         None
     }
 }
 
+impl TlsInfoFactory for SslStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        self.ssl()
+            .peer_certificate()
+            .and_then(|c| c.to_der().ok())
+            .map(|c| crate::tls::TlsInfo {
+                peer_certificate: Some(c),
+            })
+    }
+}
+
+impl TlsInfoFactory for SslStream<TokioIo<MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        self.ssl()
+            .peer_certificate()
+            .and_then(|c| c.to_der().ok())
+            .map(|c| crate::tls::TlsInfo {
+                peer_certificate: Some(c),
+            })
+    }
+}
+
+impl TlsInfoFactory for MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            MaybeHttpsStream::Https(tls) => tls
+                .inner()
+                .ssl()
+                .peer_certificate()
+                .and_then(|c| c.to_der().ok())
+                .map(|c| crate::tls::TlsInfo {
+                    peer_certificate: Some(c),
+                }),
+            MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
 pub(crate) trait AsyncConn:
-    AsyncRead + AsyncWrite + Connection + Send + Sync + Unpin + 'static
+    Read + Write + Connection + Send + Sync + Unpin + 'static
 {
 }
 
-impl<T: AsyncRead + AsyncWrite + Connection + Send + Sync + Unpin + 'static> AsyncConn for T {}
+impl<T: Read + Write + Connection + Send + Sync + Unpin + 'static> AsyncConn for T {}
 
-#[cfg(feature = "boring-tls")]
 trait AsyncConnWithInfo: AsyncConn + TlsInfoFactory {}
-#[cfg(not(feature = "boring-tls"))]
-trait AsyncConnWithInfo: AsyncConn {}
 
-#[cfg(feature = "boring-tls")]
 impl<T: AsyncConn + TlsInfoFactory> AsyncConnWithInfo for T {}
-#[cfg(not(feature = "boring-tls"))]
-impl<T: AsyncConn> AsyncConnWithInfo for T {}
 
 type BoxConn = Box<dyn AsyncConnWithInfo>;
 
-pin_project! {
-    /// Note: the `is_proxy` member means *is plain text HTTP proxy*.
-    /// This tells hyper whether the URI should be written in
-    /// * origin-form (`GET /just/a/path HTTP/1.1`), when `is_proxy == false`, or
-    /// * absolute-form (`GET http://foo.bar/and/a/path HTTP/1.1`), otherwise.
-    pub(crate) struct Conn {
-        #[pin]
-        inner: BoxConn,
-        is_proxy: bool,
-        // Only needed for __boring, but #[cfg()] on fields breaks pin_project!
-        tls_info: bool,
-    }
-}
+pub(crate) mod sealed {
+    use super::*;
 
-impl Connection for Conn {
-    fn connected(&self) -> Connected {
-        let connected = self.inner.connected().proxy(self.is_proxy);
-        #[cfg(feature = "boring-tls")]
-        if self.tls_info {
-            if let Some(tls_info) = self.inner.tls_info() {
-                connected.extra(tls_info)
+    #[derive(Debug)]
+    pub struct Unnameable(pub(super) Dst);
+
+    pin_project! {
+        /// Note: the `is_proxy` member means *is plain text HTTP proxy*.
+        /// This tells hyper whether the URI should be written in
+        /// * origin-form (`GET /just/a/path HTTP/1.1`), when `is_proxy == false`, or
+        /// * absolute-form (`GET http://foo.bar/and/a/path HTTP/1.1`), otherwise.
+        #[allow(missing_debug_implementations)]
+        pub struct Conn {
+            #[pin]
+            pub(super) inner: BoxConn,
+            pub(super) is_proxy: bool,
+            // Only needed for __tls, but #[cfg()] on fields breaks pin_project!
+            pub(super) tls_info: bool,
+        }
+    }
+
+    impl Connection for Conn {
+        fn connected(&self) -> Connected {
+            let connected = self.inner.connected().proxy(self.is_proxy);
+
+            if self.tls_info {
+                if let Some(tls_info) = self.inner.tls_info() {
+                    connected.extra(tls_info)
+                } else {
+                    connected
+                }
             } else {
                 connected
             }
-        } else {
-            connected
-        }
-        #[cfg(not(feature = "boring-tls"))]
-        connected
-    }
-}
-
-impl AsyncRead for Conn {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.project();
-        AsyncRead::poll_read(this.inner, cx, buf)
-    }
-}
-
-impl AsyncWrite for Conn {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        let this = self.project();
-        AsyncWrite::poll_write(this.inner, cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        let this = self.project();
-        AsyncWrite::poll_write_vectored(this.inner, cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-        let this = self.project();
-        AsyncWrite::poll_flush(this.inner, cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-        let this = self.project();
-        AsyncWrite::poll_shutdown(this.inner, cx)
-    }
-}
-
-pub(crate) type Connecting = Pin<Box<dyn Future<Output = Result<Conn, BoxError>> + Send>>;
-
-#[cfg(feature = "boring-tls")]
-async fn tunnel<T>(
-    mut conn: T,
-    host: &str,
-    port: u16,
-    user_agent: Option<&HeaderValue>,
-    auth: Option<HeaderValue>,
-) -> Result<T, BoxError>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut buf = format!(
-        "\
-         CONNECT {0}:{1} HTTP/1.1\r\n\
-         Host: {0}:{1}\r\n\
-         ",
-        host, port
-    )
-    .into_bytes();
-
-    // user-agent
-    if let Some(user_agent) = user_agent {
-        buf.extend_from_slice(b"User-Agent: ");
-        buf.extend_from_slice(user_agent.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
-
-    // proxy-authorization
-    if let Some(value) = auth {
-        log::debug!("tunnel to {}:{} using basic auth", host, port);
-        buf.extend_from_slice(b"Proxy-Authorization: ");
-        buf.extend_from_slice(value.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
-
-    // headers end
-    buf.extend_from_slice(b"\r\n");
-
-    conn.write_all(&buf).await?;
-
-    let mut buf = [0; 8192];
-    let mut pos = 0;
-
-    loop {
-        let n = conn.read(&mut buf[pos..]).await?;
-
-        if n == 0 {
-            return Err(tunnel_eof());
-        }
-        pos += n;
-
-        let recvd = &buf[..pos];
-        if recvd.starts_with(b"HTTP/1.1 200") || recvd.starts_with(b"HTTP/1.0 200") {
-            if recvd.ends_with(b"\r\n\r\n") {
-                return Ok(conn);
-            }
-            if pos == buf.len() {
-                return Err("proxy headers too long for tunnel".into());
-            }
-            // else read more
-        } else if recvd.starts_with(b"HTTP/1.1 407") {
-            return Err("proxy authentication required".into());
-        } else {
-            return Err("unsuccessful tunnel".into());
-        }
-    }
-}
-
-#[cfg(feature = "boring-tls")]
-fn tunnel_eof() -> BoxError {
-    "unexpected eof while tunneling".into()
-}
-
-#[cfg(feature = "boring-tls")]
-mod boring_tls_conn {
-    use hyper::client::connect::{Connected, Connection};
-    use pin_project_lite::pin_project;
-    use std::{
-        io::{self, IoSlice},
-        pin::Pin,
-        task::{Context, Poll},
-    };
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use tokio_boring::SslStream;
-
-    pin_project! {
-        pub(super) struct BoringTlsConn<T> {
-            #[pin] pub(super) inner: SslStream<T>,
         }
     }
 
-    impl<T: Connection + AsyncRead + AsyncWrite + Unpin> Connection for BoringTlsConn<T> {
-        fn connected(&self) -> Connected {
-            if self.inner.ssl().selected_alpn_protocol() == Some(b"h2") {
-                self.inner.get_ref().connected().negotiated_h2()
-            } else {
-                self.inner.get_ref().connected()
-            }
-        }
-    }
-
-    impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for BoringTlsConn<T> {
+    impl Read for Conn {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<tokio::io::Result<()>> {
+            buf: ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
             let this = self.project();
-            AsyncRead::poll_read(this.inner, cx, buf)
+            Read::poll_read(this.inner, cx, buf)
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for BoringTlsConn<T> {
+    impl Write for Conn {
         fn poll_write(
             self: Pin<&mut Self>,
             cx: &mut Context,
             buf: &[u8],
-        ) -> Poll<Result<usize, tokio::io::Error>> {
+        ) -> Poll<Result<usize, io::Error>> {
             let this = self.project();
-            AsyncWrite::poll_write(this.inner, cx, buf)
+            Write::poll_write(this.inner, cx, buf)
         }
 
         fn poll_write_vectored(
@@ -642,7 +524,105 @@ mod boring_tls_conn {
             bufs: &[IoSlice<'_>],
         ) -> Poll<Result<usize, io::Error>> {
             let this = self.project();
-            AsyncWrite::poll_write_vectored(this.inner, cx, bufs)
+            Write::poll_write_vectored(this.inner, cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+            let this = self.project();
+            Write::poll_flush(this.inner, cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
+            let this = self.project();
+            Write::poll_shutdown(this.inner, cx)
+        }
+    }
+}
+
+pub(crate) type Connecting = Pin<Box<dyn Future<Output = Result<Conn, BoxError>> + Send>>;
+
+mod tls_conn {
+    use super::TlsInfoFactory;
+    use crate::{
+        tls::MaybeHttpsStream,
+        util::{
+            client::connect::{Connected, Connection},
+            rt::TokioIo,
+        },
+    };
+    use hyper2::rt::{Read, ReadBufCursor, Write};
+    use pin_project_lite::pin_project;
+    use std::{
+        io::{self, IoSlice},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::{
+        io::{AsyncRead, AsyncWrite},
+        net::TcpStream,
+    };
+    use tokio_boring::SslStream;
+
+    pin_project! {
+        pub(super) struct BoringTlsConn<T> {
+            #[pin] pub(super) inner: TokioIo<SslStream<T>>,
+        }
+    }
+
+    impl Connection for BoringTlsConn<TokioIo<TokioIo<TcpStream>>> {
+        fn connected(&self) -> Connected {
+            let connected = self.inner.inner().get_ref().connected();
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                connected.negotiated_h2()
+            } else {
+                connected
+            }
+        }
+    }
+
+    impl Connection for BoringTlsConn<TokioIo<MaybeHttpsStream<TokioIo<TcpStream>>>> {
+        fn connected(&self) -> Connected {
+            let connected = self.inner.inner().get_ref().connected();
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                connected.negotiated_h2()
+            } else {
+                connected
+            }
+        }
+    }
+
+    impl<T: AsyncRead + AsyncWrite + Unpin> Read for BoringTlsConn<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: ReadBufCursor<'_>,
+        ) -> Poll<tokio::io::Result<()>> {
+            let this = self.project();
+            Read::poll_read(this.inner, cx, buf)
+        }
+    }
+
+    impl<T: AsyncRead + AsyncWrite + Unpin> Write for BoringTlsConn<T> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+            buf: &[u8],
+        ) -> Poll<Result<usize, tokio::io::Error>> {
+            let this = self.project();
+            Write::poll_write(this.inner, cx, buf)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<Result<usize, io::Error>> {
+            let this = self.project();
+            Write::poll_write_vectored(this.inner, cx, bufs)
         }
 
         fn is_write_vectored(&self) -> bool {
@@ -654,7 +634,7 @@ mod boring_tls_conn {
             cx: &mut Context,
         ) -> Poll<Result<(), tokio::io::Error>> {
             let this = self.project();
-            AsyncWrite::poll_flush(this.inner, cx)
+            Write::poll_flush(this.inner, cx)
         }
 
         fn poll_shutdown(
@@ -662,7 +642,92 @@ mod boring_tls_conn {
             cx: &mut Context,
         ) -> Poll<Result<(), tokio::io::Error>> {
             let this = self.project();
-            AsyncWrite::poll_shutdown(this.inner, cx)
+            Write::poll_shutdown(this.inner, cx)
+        }
+    }
+
+    impl<T> TlsInfoFactory for BoringTlsConn<T>
+    where
+        TokioIo<SslStream<T>>: TlsInfoFactory,
+    {
+        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+            self.inner.tls_info()
+        }
+    }
+}
+
+mod tunnel {
+    use super::BoxError;
+    use crate::util::rt::TokioIo;
+    use http::HeaderValue;
+    use hyper2::rt::{Read, Write};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub(super) async fn connect<T>(
+        mut conn: T,
+        host: &str,
+        port: u16,
+        auth: Option<HeaderValue>,
+    ) -> Result<T, BoxError>
+    where
+        T: Read + Write + Unpin,
+    {
+        let mut buf = format!(
+            "\
+             CONNECT {0}:{1} HTTP/1.1\r\n\
+             Host: {0}:{1}\r\n\
+             ",
+            host, port
+        )
+        .into_bytes();
+
+        // user-agent
+        buf.extend_from_slice(b"User-Agent: ");
+        buf.extend_from_slice(env!("CARGO_PKG_NAME").as_bytes());
+        buf.extend_from_slice(b"/");
+        buf.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        buf.extend_from_slice(b"\r\n");
+
+        // proxy-authorization
+        if let Some(value) = auth {
+            log::debug!("tunnel to {}:{} using basic auth", host, port);
+            buf.extend_from_slice(b"Proxy-Authorization: ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+
+        // headers end
+        buf.extend_from_slice(b"\r\n");
+
+        let mut tokio_conn = TokioIo::new(&mut conn);
+
+        tokio_conn.write_all(&buf).await?;
+
+        let mut buf = [0; 8192];
+        let mut pos = 0;
+
+        loop {
+            let n = tokio_conn.read(&mut buf[pos..]).await?;
+
+            if n == 0 {
+                return Err("unexpected eof while tunneling".into());
+            }
+            pos += n;
+
+            let recvd = &buf[..pos];
+            if recvd.starts_with(b"HTTP/1.1 200") || recvd.starts_with(b"HTTP/1.0 200") {
+                if recvd.ends_with(b"\r\n\r\n") {
+                    return Ok(conn);
+                }
+                if pos == buf.len() {
+                    return Err("proxy headers too long for tunnel".into());
+                }
+            // else read more
+            } else if recvd.starts_with(b"HTTP/1.1 407") {
+                return Err("proxy authentication required".into());
+            } else {
+                return Err("unsuccessful tunnel".into());
+            }
         }
     }
 }
@@ -686,7 +751,7 @@ mod socks {
 
     pub(super) async fn connect(
         proxy: ProxyScheme,
-        dst: Uri,
+        dst: &Uri,
         dns: DnsResolve,
     ) -> Result<TcpStream, BoxError> {
         let https = dst.scheme() == Some(&Scheme::HTTPS);
@@ -738,13 +803,13 @@ mod socks {
 }
 
 mod verbose {
-    use hyper::client::connect::{Connected, Connection};
+    use crate::util::client::connect::{Connected, Connection};
+    use hyper2::rt::{Read, ReadBufCursor, Write};
     use std::cmp::min;
     use std::fmt;
     use std::io::{self, IoSlice};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     pub(super) const OFF: Wrapper = Wrapper(false);
 
@@ -770,21 +835,31 @@ mod verbose {
         inner: T,
     }
 
-    impl<T: Connection + AsyncRead + AsyncWrite + Unpin> Connection for Verbose<T> {
+    impl<T: Connection + Read + Write + Unpin> Connection for Verbose<T> {
         fn connected(&self) -> Connected {
             self.inner.connected()
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for Verbose<T> {
+    impl<T: Read + Write + Unpin> Read for Verbose<T> {
         fn poll_read(
             mut self: Pin<&mut Self>,
             cx: &mut Context,
-            buf: &mut ReadBuf<'_>,
+            mut buf: ReadBufCursor<'_>,
         ) -> Poll<std::io::Result<()>> {
-            match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            // TODO: This _does_ forget the `init` len, so it could result in
+            // re-initializing twice. Needs upstream support, perhaps.
+            // SAFETY: Passing to a ReadBuf will never de-initialize any bytes.
+            let mut vbuf = hyper2::rt::ReadBuf::uninit(unsafe { buf.as_mut() });
+            match Pin::new(&mut self.inner).poll_read(cx, vbuf.unfilled()) {
                 Poll::Ready(Ok(())) => {
-                    log::trace!("{:08x} read: {:?}", self.id, Escape(buf.filled()));
+                    log::trace!("{:08x} read: {:?}", self.id, Escape(vbuf.filled()));
+                    let len = vbuf.filled().len();
+                    // SAFETY: The two cursors were for the same buffer. What was
+                    // filled in one is safe in the other.
+                    unsafe {
+                        buf.advance(len);
+                    }
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -793,7 +868,7 @@ mod verbose {
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Verbose<T> {
+    impl<T: Read + Write + Unpin> Write for Verbose<T> {
         fn poll_write(
             mut self: Pin<&mut Self>,
             cx: &mut Context,
@@ -847,7 +922,6 @@ mod verbose {
         }
     }
 
-    #[cfg(feature = "boring-tls")]
     impl<T: super::TlsInfoFactory> super::TlsInfoFactory for Verbose<T> {
         fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
             self.inner.tls_info()
@@ -901,171 +975,5 @@ mod verbose {
             }
             Ok(())
         }
-    }
-}
-
-#[cfg(feature = "boring-tls")]
-#[cfg(test)]
-mod tests {
-    use super::tunnel;
-    use crate::proxy;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
-    use tokio::net::TcpStream;
-    use tokio::runtime;
-
-    static TUNNEL_UA: &str = "tunnel-test/x.y";
-    static TUNNEL_OK: &[u8] = b"\
-        HTTP/1.1 200 OK\r\n\
-        \r\n\
-    ";
-
-    macro_rules! mock_tunnel {
-        () => {{
-            mock_tunnel!(TUNNEL_OK)
-        }};
-        ($write:expr) => {{
-            mock_tunnel!($write, "")
-        }};
-        ($write:expr, $auth:expr) => {{
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let connect_expected = format!(
-                "\
-                 CONNECT {0}:{1} HTTP/1.1\r\n\
-                 Host: {0}:{1}\r\n\
-                 User-Agent: {2}\r\n\
-                 {3}\
-                 \r\n\
-                 ",
-                addr.ip(),
-                addr.port(),
-                TUNNEL_UA,
-                $auth
-            )
-            .into_bytes();
-
-            thread::spawn(move || {
-                let (mut sock, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).unwrap();
-                assert_eq!(&buf[..n], &connect_expected[..]);
-
-                sock.write_all($write).unwrap();
-            });
-            addr
-        }};
-    }
-
-    fn ua() -> Option<http::header::HeaderValue> {
-        Some(http::header::HeaderValue::from_static(TUNNEL_UA))
-    }
-
-    #[test]
-    fn test_tunnel() {
-        let addr = mock_tunnel!();
-
-        let rt = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("new rt");
-        let f = async move {
-            let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.ip().to_string();
-            let port = addr.port();
-            tunnel(tcp, &host, port, ua().as_ref(), None).await
-        };
-
-        rt.block_on(f).unwrap();
-    }
-
-    #[test]
-    fn test_tunnel_eof() {
-        let addr = mock_tunnel!(b"HTTP/1.1 200 OK");
-
-        let rt = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("new rt");
-        let f = async move {
-            let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.ip().to_string();
-            let port = addr.port();
-            tunnel(tcp, &host, port, ua().as_ref(), None).await
-        };
-
-        rt.block_on(f).unwrap_err();
-    }
-
-    #[test]
-    fn test_tunnel_non_http_response() {
-        let addr = mock_tunnel!(b"foo bar baz hallo");
-
-        let rt = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("new rt");
-        let f = async move {
-            let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.ip().to_string();
-            let port = addr.port();
-            tunnel(tcp, &host, port, ua().as_ref(), None).await
-        };
-
-        rt.block_on(f).unwrap_err();
-    }
-
-    #[test]
-    fn test_tunnel_proxy_unauthorized() {
-        let addr = mock_tunnel!(
-            b"\
-            HTTP/1.1 407 Proxy Authentication Required\r\n\
-            Proxy-Authenticate: Basic realm=\"nope\"\r\n\
-            \r\n\
-        "
-        );
-
-        let rt = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("new rt");
-        let f = async move {
-            let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.ip().to_string();
-            let port = addr.port();
-            tunnel(tcp, &host, port, ua().as_ref(), None).await
-        };
-
-        let error = rt.block_on(f).unwrap_err();
-        assert_eq!(error.to_string(), "proxy authentication required");
-    }
-
-    #[test]
-    fn test_tunnel_basic_auth() {
-        let addr = mock_tunnel!(
-            TUNNEL_OK,
-            "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n"
-        );
-
-        let rt = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("new rt");
-        let f = async move {
-            let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.ip().to_string();
-            let port = addr.port();
-            tunnel(
-                tcp,
-                &host,
-                port,
-                ua().as_ref(),
-                Some(proxy::encode_basic_auth("Aladdin", "open sesame")),
-            )
-            .await
-        };
-
-        rt.block_on(f).unwrap();
     }
 }

@@ -1,5 +1,4 @@
 mod support;
-use rquest;
 use support::server;
 
 #[tokio::test]

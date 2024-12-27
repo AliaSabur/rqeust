@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use url::Url;
 
 /// A trait to try to convert some type into a `Url`.
@@ -8,8 +9,10 @@ pub trait IntoUrl: IntoUrlSealed {}
 
 impl IntoUrl for Url {}
 impl IntoUrl for String {}
-impl<'a> IntoUrl for &'a str {}
-impl<'a> IntoUrl for &'a String {}
+impl IntoUrl for &Url {}
+impl IntoUrl for &str {}
+impl IntoUrl for &String {}
+impl IntoUrl for Cow<'_, str> {}
 
 pub trait IntoUrlSealed {
     // Besides parsing as a valid `Url`, the `Url` must be a valid
@@ -21,16 +24,6 @@ pub trait IntoUrlSealed {
 
 impl IntoUrlSealed for Url {
     fn into_url(self) -> crate::Result<Url> {
-        // With blob url the `self.has_host()` check is always false, so we
-        // remove the `blob:` scheme and check again if the url is valid.
-        #[cfg(target_arch = "wasm32")]
-        if self.scheme() == "blob"
-            && self.path().starts_with("http") // Check if the path starts with http or https to avoid validating a `blob:blob:...` url.
-            && self.as_str()[5..].into_url().is_ok()
-        {
-            return Ok(self);
-        }
-
         if self.has_host() {
             Ok(self)
         } else {
@@ -43,7 +36,21 @@ impl IntoUrlSealed for Url {
     }
 }
 
-impl<'a> IntoUrlSealed for &'a str {
+impl IntoUrlSealed for &Url {
+    fn into_url(self) -> crate::Result<Url> {
+        if self.has_host() {
+            Ok(self.clone())
+        } else {
+            Err(crate::error::url_bad_scheme(self.clone()))
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl IntoUrlSealed for &str {
     fn into_url(self) -> crate::Result<Url> {
         Url::parse(self).map_err(crate::error::builder)?.into_url()
     }
@@ -53,7 +60,7 @@ impl<'a> IntoUrlSealed for &'a str {
     }
 }
 
-impl<'a> IntoUrlSealed for &'a String {
+impl IntoUrlSealed for &String {
     fn into_url(self) -> crate::Result<Url> {
         (&**self).into_url()
     }
@@ -73,10 +80,13 @@ impl IntoUrlSealed for String {
     }
 }
 
-pub(crate) fn expect_uri(url: &Url) -> http::Uri {
-    url.as_str()
-        .parse()
-        .expect("a parsed Url should always be a valid Uri")
+impl IntoUrlSealed for Cow<'_, str> {
+    fn into_url(self) -> crate::Result<Url> {
+        (&*self).into_url()
+    }
+    fn as_str(&self) -> &str {
+        self
+    }
 }
 
 pub(crate) fn try_uri(url: &Url) -> Option<http::Uri> {
@@ -103,5 +113,17 @@ mod tests {
             err.to_string(),
             "builder error for url (blob:https://example.com): URL scheme is not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_request_rejects_invalid_hostname() {
+        let url_str = "https://{{hostname}}/";
+        let url = url::Url::parse(url_str).unwrap();
+        let result = crate::get(url).await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.is_builder());
+        assert_eq!(url_str, err.url().unwrap().as_str());
     }
 }

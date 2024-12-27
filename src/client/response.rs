@@ -1,29 +1,33 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
-use encoding_rs::{Encoding, UTF_8};
-use futures_util::stream::StreamExt;
-use hyper::client::connect::HttpInfo;
-use hyper::{HeaderMap, StatusCode, Version};
-use mime::Mime;
+use hyper2::{HeaderMap, StatusCode, Version};
 #[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
 #[cfg(feature = "json")]
 use serde_json;
 use tokio::time::Sleep;
 use url::Url;
+use util::client::connect::HttpInfo;
 
 use super::body::Body;
+use super::body::ResponseBody;
 use super::decoder::{Accepts, Decoder};
 #[cfg(feature = "cookies")]
 use crate::cookie;
-use crate::response::ResponseUrl;
+use crate::util;
+
+#[cfg(feature = "charset")]
+use encoding_rs::{Encoding, UTF_8};
+#[cfg(feature = "charset")]
+use mime::Mime;
 
 /// A Response to a submitted `Request`.
 pub struct Response {
-    pub(super) res: hyper::Response<Decoder>,
+    pub(super) res: hyper2::Response<Decoder>,
     // Boxed to save space (11 words to 1 word), and it's not accessed
     // frequently internally.
     url: Box<Url>,
@@ -31,14 +35,19 @@ pub struct Response {
 
 impl Response {
     pub(super) fn new(
-        res: hyper::Response<hyper::Body>,
+        res: hyper2::Response<ResponseBody>,
         url: Url,
         accepts: Accepts,
-        timeout: Option<Pin<Box<Sleep>>>,
+        total_timeout: Option<Pin<Box<Sleep>>>,
+        read_timeout: Option<Duration>,
     ) -> Response {
         let (mut parts, body) = res.into_parts();
-        let decoder = Decoder::detect(&mut parts.headers, Body::response(body, timeout), accepts);
-        let res = hyper::Response::from_parts(parts, decoder);
+        let decoder = Decoder::detect(
+            &mut parts.headers,
+            super::body::response(body, total_timeout, read_timeout),
+            accepts,
+        );
+        let res = hyper2::Response::from_parts(parts, decoder);
 
         Response {
             res,
@@ -78,9 +87,9 @@ impl Response {
     /// - The response is compressed and automatically decoded (thus changing
     ///   the actual decoded length).
     pub fn content_length(&self) -> Option<u64> {
-        use hyper::body::HttpBody;
+        use hyper2::body::Body;
 
-        HttpBody::size_hint(self.res.body()).exact()
+        Body::size_hint(self.res.body()).exact()
     }
 
     /// Retrieve the cookies contained in the response.
@@ -92,7 +101,7 @@ impl Response {
     /// This requires the optional `cookies` feature to be enabled.
     #[cfg(feature = "cookies")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
-    pub fn cookies<'a>(&'a self) -> impl Iterator<Item = cookie::Cookie<'a>> + 'a {
+    pub fn cookies(&self) -> impl Iterator<Item = cookie::Cookie> {
         cookie::extract_response_cookies(self.res.headers()).filter_map(Result::ok)
     }
 
@@ -131,6 +140,11 @@ impl Response {
     ///
     /// Note that the BOM is stripped from the returned String.
     ///
+    /// # Note
+    ///
+    /// If the `charset` feature is disabled the method will only attempt to decode the
+    /// response as UTF-8, regardless of the given `Content-Type`
+    ///
     /// # Example
     ///
     /// ```
@@ -140,12 +154,22 @@ impl Response {
     ///     .text()
     ///     .await?;
     ///
-    /// println!("text: {:?}", content);
+    /// println!("text: {content:?}");
     /// # Ok(())
     /// # }
     /// ```
     pub async fn text(self) -> crate::Result<String> {
-        self.text_with_charset("utf-8").await
+        #[cfg(feature = "charset")]
+        {
+            self.text_with_charset("utf-8").await
+        }
+
+        #[cfg(not(feature = "charset"))]
+        {
+            let full = self.bytes().await?;
+            let text = String::from_utf8_lossy(&full);
+            Ok(text.into_owned())
+        }
     }
 
     /// Get the full response text given a specific encoding.
@@ -160,6 +184,10 @@ impl Response {
     ///
     /// [`encoding_rs`]: https://docs.rs/encoding_rs/0.8/encoding_rs/#relationship-with-windows-code-pages
     ///
+    /// # Optional
+    ///
+    /// This requires the optional `encoding_rs` feature enabled.
+    ///
     /// # Example
     ///
     /// ```
@@ -169,10 +197,12 @@ impl Response {
     ///     .text_with_charset("utf-8")
     ///     .await?;
     ///
-    /// println!("text: {:?}", content);
+    /// println!("text: {content:?}");
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "charset")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "charset")))]
     pub async fn text_with_charset(self, default_encoding: &str) -> crate::Result<String> {
         let content_type = self
             .headers()
@@ -251,12 +281,16 @@ impl Response {
     ///     .bytes()
     ///     .await?;
     ///
-    /// println!("bytes: {:?}", bytes);
+    /// println!("bytes: {bytes:?}");
     /// # Ok(())
     /// # }
     /// ```
     pub async fn bytes(self) -> crate::Result<Bytes> {
-        hyper::body::to_bytes(self.res.into_body()).await
+        use http_body_util::BodyExt;
+
+        BodyExt::collect(self.res.into_body())
+            .await
+            .map(|buf| buf.to_bytes())
     }
 
     /// Stream a chunk of the response body.
@@ -270,16 +304,25 @@ impl Response {
     /// let mut res = rquest::get("https://hyper.rs").await?;
     ///
     /// while let Some(chunk) = res.chunk().await? {
-    ///     println!("Chunk: {:?}", chunk);
+    ///     println!("Chunk: {chunk:?}");
     /// }
     /// # Ok(())
     /// # }
     /// ```
     pub async fn chunk(&mut self) -> crate::Result<Option<Bytes>> {
-        if let Some(item) = self.res.body_mut().next().await {
-            Ok(Some(item?))
-        } else {
-            Ok(None)
+        use http_body_util::BodyExt;
+
+        // loop to ignore unrecognized frames
+        loop {
+            if let Some(res) = self.res.body_mut().frame().await {
+                let frame = res?;
+                if let Ok(buf) = frame.into_data() {
+                    return Ok(Some(buf));
+                }
+                // else continue
+            } else {
+                return Ok(None);
+            }
         }
     }
 
@@ -308,7 +351,7 @@ impl Response {
     #[cfg(feature = "stream")]
     #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
     pub fn bytes_stream(self) -> impl futures_core::Stream<Item = crate::Result<Bytes>> {
-        self.res.into_body()
+        super::body::DataStream(self.res.into_body())
     }
 
     // util methods
@@ -384,49 +427,19 @@ impl fmt::Debug for Response {
     }
 }
 
-impl<T: Into<Body>> From<http::Response<T>> for Response {
-    fn from(r: http::Response<T>) -> Response {
-        let (mut parts, body) = r.into_parts();
-        let body = body.into();
-        let decoder = Decoder::detect(&mut parts.headers, body, Accepts::none());
-        let url = parts
-            .extensions
-            .remove::<ResponseUrl>()
-            .unwrap_or_else(|| ResponseUrl(Url::parse("http://no.url.provided.local").unwrap()));
-        let url = url.0;
-        let res = hyper::Response::from_parts(parts, decoder);
-        Response {
-            res,
-            url: Box::new(url),
-        }
-    }
-}
-
 /// A `Response` can be piped as the `Body` of another request.
 impl From<Response> for Body {
     fn from(r: Response) -> Body {
-        Body::stream(r.res.into_body())
+        Body::wrap(r.res.into_body())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Response;
-    use crate::ResponseBuilderExt;
-    use http::response::Builder;
-    use url::Url;
-
-    #[test]
-    fn test_from_http_response() {
-        let url = Url::parse("http://example.com").unwrap();
-        let response = Builder::new()
-            .status(200)
-            .url(url.clone())
-            .body("foo")
-            .unwrap();
-        let response = Response::from(response);
-
-        assert_eq!(response.status(), 200);
-        assert_eq!(*response.url(), url);
+/// A `Response` can be converted into a `http::Response`.
+// It's supposed to be the inverse of the conversion above.
+impl From<Response> for http::Response<Body> {
+    fn from(r: Response) -> http::Response<Body> {
+        let (parts, body) = r.res.into_parts();
+        let body = Body::wrap(body);
+        http::Response::from_parts(parts, body)
     }
 }
